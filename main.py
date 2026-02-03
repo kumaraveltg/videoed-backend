@@ -48,6 +48,14 @@ class TextOverlayRequest(BaseModel):
     filename: str
     overlays: list[TextOverlay]
 
+class FinalMergeRequest(BaseModel):
+    main_video: str
+    secondary_video: Optional[str] = None  # optional split-screen video
+    audio: Optional[str] = None            # optional external audio
+    text_overlays: Optional[List[TextOverlay]] = []
+    output_name: str = "final_merged.mp4"
+    split_mode: Literal["horizontal", "vertical", "none"] = "none"
+
 # ---- CORS (for React) ----
 app.add_middleware(
     CORSMiddleware,
@@ -764,3 +772,101 @@ def split_screen(req: SplitScreenRequest):
         "output": output_name,
         "video_url": f"http://localhost:8000/videos/{output_name}"
     }
+
+# -----------------------------
+# Endpoint: Final Merge
+# -----------------------------
+@app.post("/video/final-merge")
+def final_merge(req: FinalMergeRequest):
+    try:
+        inputs = []
+        filter_complex = []
+
+        main_path = os.path.join(UPLOAD_DIR, req.main_video)
+        if not os.path.exists(main_path):
+            return JSONResponse(status_code=404, content={"error": "Main video not found"})
+        inputs.append(f"-i \"{main_path}\"")
+
+        # Optional secondary video for split-screen
+        if req.secondary_video and req.split_mode != "none":
+            sec_path = os.path.join(UPLOAD_DIR, req.secondary_video)
+            if not os.path.exists(sec_path):
+                return JSONResponse(status_code=404, content={"error": "Secondary video not found"})
+            inputs.append(f"-i \"{sec_path}\"")
+
+        # Optional external audio
+        if req.audio:
+            audio_path = os.path.join(UPLOAD_DIR, req.audio)
+            if not os.path.exists(audio_path):
+                return JSONResponse(status_code=404, content={"error": "Audio file not found"})
+            inputs.append(f"-i \"{audio_path}\"")
+
+        # -----------------------------
+        # Video filter
+        # -----------------------------
+        vout = "[vout]"
+        if req.secondary_video and req.split_mode == "vertical":
+            # stack vertically
+            filter_complex.append(f"[0:v]scale=1280:360[v0];[1:v]scale=1280:360[v1];[v0][v1]vstack=inputs=2{vout}")
+        elif req.secondary_video and req.split_mode == "horizontal":
+            # stack horizontally
+            filter_complex.append(f"[0:v]scale=640:720[v0];[1:v]scale=640:720[v1];[v0][v1]hstack=inputs=2{vout}")
+        else:
+            # single video
+            vout = "0:v"
+
+        # -----------------------------
+        # Text overlays
+        # -----------------------------
+        if req.text_overlays:
+            draw_filters = []
+            for o in req.text_overlays:
+                safe_text = o.text.replace("'", r"\'").replace(":", r'\:')
+                x_expr, y_expr = get_text_xy_expr(o.position, o.x, o.y)
+                draw_filters.append(
+                    f"drawtext=text='{safe_text}':x={x_expr}:y={y_expr}:fontsize={o.fontsize}:fontcolor={o.fontcolor}:box=1:boxcolor=black@0.4:enable='between(t,{o.start},{o.end})'"
+                )
+            # attach drawtext to main video or stacked video
+            drawtext_filter = ",".join(draw_filters)
+            if req.secondary_video != None:
+                filter_complex.append(f"{vout},{drawtext_filter}{vout}")
+            else:
+                filter_complex.append(f"[0:v]{drawtext_filter}{vout}")
+
+        # -----------------------------
+        # Audio mapping
+        # -----------------------------
+        audio_map = []
+        if req.audio:
+            # external audio mixed with main video
+            audio_map = ["-map", f"{len(inputs)-1}:a:0", "-map", f"0:a:0", "-filter_complex", "[0:a][1:a]amix=inputs=2[aout]", "-map", "[aout]"]
+        else:
+            audio_map = ["-map", f"{0}:a:0"]
+
+        # -----------------------------
+        # Output
+        # -----------------------------
+        output_name = req.output_name
+        output_path = os.path.join(UPLOAD_DIR, output_name)
+
+        ffmpeg_cmd = f'{FFMPEG_PATH} -y {" ".join(inputs)}'
+        if filter_complex:
+            ffmpeg_cmd += f' -filter_complex "{";".join(filter_complex)}"'
+        ffmpeg_cmd += " -c:v libx264 -c:a aac -b:a 192k -pix_fmt yuv420p "
+        if audio_map:
+            ffmpeg_cmd += " " + " ".join(audio_map)
+        ffmpeg_cmd += f' "{output_path}"'
+
+        print("FFMPEG CMD:", ffmpeg_cmd)
+        subprocess.run(ffmpeg_cmd, shell=True, check=True)
+
+        return {
+            "message": "Final merge successful",
+            "output": output_name,
+            "video_url": f"http://localhost:8000/videos/{output_name}"
+        }
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(status_code=400, content={"error": str(e)})
