@@ -141,6 +141,7 @@ def delete_to_keep_ranges(delete_ranges: List[dict], total_duration: float) -> L
 # -----------------------------
 @app.post("/upload/local")
 async def upload_local(file: UploadFile = File(...)):
+
     filename = safe_filename(file.filename)
     file_path = os.path.join(UPLOAD_DIR, filename)
 
@@ -148,29 +149,61 @@ async def upload_local(file: UploadFile = File(...)):
     with open(file_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
 
-    # ---- Extract audio using FFmpeg ----
+    # ===============================
+    # 🎬 Generate timeline thumbnails
+    # ===============================
+    thumb_dir = os.path.join(UPLOAD_DIR, f"{filename}_thumbs")
+    os.makedirs(thumb_dir, exist_ok=True)
+
+    thumb_pattern = os.path.join(thumb_dir, "thumb_%04d.jpg")
+
+    result = subprocess.run(
+    [
+        r"E:\ffmpeg\bin\ffmpeg.exe",
+        "-y",
+        "-i", file_path,
+        "-vf", "fps=1,scale=160:-1",
+        thumb_pattern
+    ],
+    capture_output=True,
+    text=True
+)
+
+    if result.returncode != 0:
+        print(f"FFmpeg thumbnail generation failed: {result.stderr}")
+
+    # collect thumbnails
+    thumbnails = []
+    for f in sorted(os.listdir(thumb_dir)):
+        if f.startswith("thumb_"):
+            thumbnails.append(
+                f"http://localhost:8000/videos/{filename}_thumbs/{f}"
+            )
+
+    # ===============================
+    # 🔊 Extract audio (your original code)
+    # ===============================
     base_name = os.path.splitext(filename)[0]
-    audio_filename = base_name + "_audio.m4a"   # or .mp3 if you want
+    audio_filename = base_name + "_audio.m4a"
     audio_path = os.path.join(UPLOAD_DIR, audio_filename)
 
-    # FFmpeg command (no re-encode = fast)
-    ffmpeg_cmd = (
+    ffmpeg_audio_cmd = (
         f'"{r"E:\ffmpeg\bin\ffmpeg.exe"}" '
         f'-y -i "{file_path}" -vn -acodec copy "{audio_path}"'
     )
 
-    os.system(ffmpeg_cmd)
+    os.system(ffmpeg_audio_cmd)
 
-    # ---- Validate audio file ----
     if not os.path.exists(audio_path) or os.path.getsize(audio_path) == 0:
-        audio_filename = None  # extraction failed
+        audio_filename = None
 
     return {
-        "message": "File uploaded successfully (video + audio separated)",
+        "message": "File uploaded successfully",
         "filename": filename,
         "video_url": f"http://localhost:8000/videos/{filename}",
         "audio_filename": audio_filename,
-        "audio_url": f"http://localhost:8000/videos/{audio_filename}" if audio_filename else None
+        "audio_url": f"http://localhost:8000/videos/{audio_filename}" if audio_filename else None,
+        "thumbnails": thumbnails
     }
 
 @app.post("/video/trim")
@@ -616,12 +649,12 @@ def audio_control(req: AudioModeRequest):
 
     audio_path = None
     if req.audio_filename:
-        audio_path = os.path.join(UPLOAD_DIR, req.audio_filename)
+        audio_path = os.path.join(UPLOAD_DIREC, req.audio_filename)
         if not os.path.exists(audio_path):
             return JSONResponse(status_code=404, content={"error": "Audio not found"})
 
     output_name = f"audio_{req.mode}_{uuid.uuid4().hex}.mp4"
-    output_path = os.path.join(UPLOAD_DIR, output_name)
+    output_path = os.path.join(UPLOAD_DIREC, output_name)
 
     mode = req.mode.lower()
 
