@@ -638,8 +638,15 @@ class AudioModeRequest(BaseModel):
 
 @app.post("/video/audio-control")
 def audio_control(req: AudioModeRequest):
+    """
+    Process video audio based on mode:
+    - mute: Remove all audio
+    - keep: Keep original video audio (no processing)
+    - replace: Replace video audio with uploaded audio
+    - mix: Mix video audio with uploaded audio
+    """
 
-    UPLOAD_DIREC = r"E:\videoed\backend\ven\videouploads"
+    UPLOAD_DIREC = r"E:\videoed-backend\videouploads"
     FFMPEG_PATH = r"E:\ffmpeg\bin\ffmpeg.exe"
 
     input_video = os.path.join(UPLOAD_DIREC, req.filename)
@@ -658,14 +665,26 @@ def audio_control(req: AudioModeRequest):
 
     mode = req.mode.lower()
 
-    # ---------------- MUTE ----------------
-    if mode == "mute":
+    # ---------------- KEEP ----------------
+    if mode == "keep":
+        # Just copy the video with its original audio (fast operation)
         ffmpeg_cmd = [
             FFMPEG_PATH,
             "-y",
             "-i", input_video,
             "-c:v", "copy",
-            "-an",
+            "-c:a", "copy",
+            output_path
+        ]
+
+    # ---------------- MUTE ----------------
+    elif mode == "mute":
+        ffmpeg_cmd = [
+            FFMPEG_PATH,
+            "-y",
+            "-i", input_video,
+            "-c:v", "copy",
+            "-an",  # Remove all audio streams
             output_path
         ]
 
@@ -674,18 +693,20 @@ def audio_control(req: AudioModeRequest):
         if not audio_path:
             return JSONResponse(status_code=400, content={"error": "audio_filename required for replace"})
 
-        # Loop audio so it always matches video length
+        # Replace video audio with new audio
+        # Loop audio if shorter than video, cut if longer
         ffmpeg_cmd = [
             FFMPEG_PATH,
             "-y",
             "-i", input_video,
-            "-stream_loop", "-1",
+            "-stream_loop", "-1",  # Loop audio infinitely
             "-i", audio_path,
-            "-map", "0:v:0",
-            "-map", "1:a:0",
+            "-map", "0:v:0",       # Take video from first input
+            "-map", "1:a:0",       # Take audio from second input
             "-c:v", "copy",
             "-c:a", "aac",
-            "-shortest",
+            "-b:a", "192k",        # Audio bitrate
+            "-shortest",           # Stop when shortest stream ends (video)
             output_path
         ]
 
@@ -694,10 +715,12 @@ def audio_control(req: AudioModeRequest):
         if not audio_path:
             return JSONResponse(status_code=400, content={"error": "audio_filename required for mix"})
 
+        # Mix both audio streams
+        # apad ensures both streams have same length
         filter_complex = (
-            "[0:a]volume=1.0[a0];"
-            "[1:a]volume=1.0,apad[a1];"
-            "[a0][a1]amix=inputs=2:duration=longest[aout]"
+            "[0:a]volume=0.7[a0];"      # Video audio at 70%
+            "[1:a]volume=0.7,aloop=loop=-1:size=2e+09[a1];"  # Loop added audio
+            "[a0][a1]amix=inputs=2:duration=first:dropout_transition=2[aout]"  # Mix and match to video length
         )
 
         ffmpeg_cmd = [
@@ -710,15 +733,35 @@ def audio_control(req: AudioModeRequest):
             "-map", "[aout]",
             "-c:v", "copy",
             "-c:a", "aac",
+            "-b:a", "192k",
             output_path
         ]
 
     else:
-        return JSONResponse(status_code=400, content={"error": "Invalid mode. Use mute | replace | mix"})
+        return JSONResponse(status_code=400, content={"error": "Invalid mode. Use mute | keep | replace | mix"})
 
+    print("=" * 60)
+    print(f"AUDIO CONTROL MODE: {mode.upper()}")
+    print("=" * 60)
     print("FFMPEG CMD:", " ".join(ffmpeg_cmd))
+    print("=" * 60)
 
-    subprocess.run(ffmpeg_cmd, check=True)
+    try:
+        result = subprocess.run(
+            ffmpeg_cmd, 
+            check=True,
+            capture_output=True,
+            text=True
+        )
+        print("✅ FFmpeg Success")
+        
+    except subprocess.CalledProcessError as e:
+        print("❌ FFmpeg Error:")
+        print(e.stderr)
+        return JSONResponse(
+            status_code=500, 
+            content={"error": f"FFmpeg failed: {e.stderr[:200]}"}
+        )
 
     return {
         "message": f"Audio {mode} successful",
@@ -726,6 +769,12 @@ def audio_control(req: AudioModeRequest):
         "video_url": f"http://localhost:8000/videos/{output_name}"
     }
 
+@app.post("/upload/audio")
+async def upload_audio(file: UploadFile = File(...)):
+    path = os.path.join(UPLOAD_DIREC, file.filename)
+    with open(path, "wb") as f:
+        f.write(await file.read())
+    return {"filename": file.filename}
 
 class SplitScreenRequest(BaseModel):
     top_video: str
