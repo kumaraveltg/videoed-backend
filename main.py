@@ -13,8 +13,15 @@ from pydantic import BaseModel
 import subprocess
 import uuid
 from typing import List,Optional,Literal 
+import json
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+import aiofiles
+
 
 app = FastAPI()
+
+executor = ThreadPoolExecutor(max_workers=4)
 
 class MergeRequest(BaseModel):
     files: list[str]
@@ -141,60 +148,89 @@ def delete_to_keep_ranges(delete_ranges: List[dict], total_duration: float) -> L
 # -----------------------------
 @app.post("/upload/local")
 async def upload_local(file: UploadFile = File(...)):
-
     filename = safe_filename(file.filename)
     file_path = os.path.join(UPLOAD_DIR, filename)
 
-    # ---- Save uploaded video ----
-    with open(file_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
+    # ✅ OPTIMIZATION 1: Async file saving
+    # Stream file in chunks instead of copying all at once
+    async with aiofiles.open(file_path, 'wb') as f:
+        while chunk := await file.read(1024 * 1024):  # 1MB chunks
+            await f.write(chunk)
 
-    # ===============================
-    # 🎬 Generate timeline thumbnails
-    # ===============================
+    # ✅ OPTIMIZATION 2: Run thumbnails and audio extraction in PARALLEL
+    # Instead of sequential (thumb → audio), do both at same time
+    
     thumb_dir = os.path.join(UPLOAD_DIR, f"{filename}_thumbs")
     os.makedirs(thumb_dir, exist_ok=True)
-
     thumb_pattern = os.path.join(thumb_dir, "thumb_%04d.jpg")
-
-    result = subprocess.run(
-    [
-        r"E:\ffmpeg\bin\ffmpeg.exe",
-        "-y",
-        "-i", file_path,
-        "-vf", "fps=1,scale=160:-1",
-        thumb_pattern
-    ],
-    capture_output=True,
-    text=True
-)
-
-    if result.returncode != 0:
-        print(f"FFmpeg thumbnail generation failed: {result.stderr}")
-
-    # collect thumbnails
-    thumbnails = []
-    for f in sorted(os.listdir(thumb_dir)):
-        if f.startswith("thumb_"):
-            thumbnails.append(
-                f"http://localhost:8000/videos/{filename}_thumbs/{f}"
-            )
-
-    # ===============================
-    # 🔊 Extract audio (your original code)
-    # ===============================
+    
     base_name = os.path.splitext(filename)[0]
     audio_filename = base_name + "_audio.m4a"
     audio_path = os.path.join(UPLOAD_DIR, audio_filename)
 
-    ffmpeg_audio_cmd = (
-        f'"{r"E:\ffmpeg\bin\ffmpeg.exe"}" '
-        f'-y -i "{file_path}" -vn -acodec copy "{audio_path}"'
+    # ✅ Run both FFmpeg tasks in parallel
+    async def generate_thumbnails():
+        """Async thumbnail generation"""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            executor,
+            subprocess.run,
+            [
+                r"E:\ffmpeg\bin\ffmpeg.exe",
+                "-y",
+                "-i", file_path,
+                "-vf", "fps=1,scale=160:-1",
+                "-q:v", "5",  # ✅ Lower quality = faster
+                "-threads", "2",  # ✅ Use 2 CPU cores
+                thumb_pattern
+            ],
+            True,  # capture_output
+            True   # text
+        )
+
+    async def extract_audio():
+        """Async audio extraction"""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            executor,
+            subprocess.run,
+            [
+                r"E:\ffmpeg\bin\ffmpeg.exe",
+                "-y",
+                "-i", file_path,
+                "-vn",
+                "-acodec", "copy",
+                audio_path
+            ],
+            True,  # capture_output
+            True   # text
+        )
+
+    # ✅ CRITICAL: Run both tasks in parallel (saves ~50% time)
+    thumb_result, audio_result = await asyncio.gather(
+        generate_thumbnails(),
+        extract_audio(),
+        return_exceptions=True  # Don't fail if one errors
     )
 
-    os.system(ffmpeg_audio_cmd)
+    # Check results
+    if isinstance(thumb_result, Exception) or thumb_result.returncode != 0:
+        print(f"⚠️ Thumbnail generation failed: {thumb_result}")
+    
+    if isinstance(audio_result, Exception):
+        print(f"⚠️ Audio extraction failed: {audio_result}")
 
-    if not os.path.exists(audio_path) or os.path.getsize(audio_path) == 0:
+    # ✅ OPTIMIZATION 3: Faster thumbnail collection
+    # Use glob instead of listdir + filter
+    import glob
+    thumbnails = [
+        f"http://localhost:8000/videos/{filename}_thumbs/{os.path.basename(f)}"
+        for f in sorted(glob.glob(os.path.join(thumb_dir, "thumb_*.jpg")))
+    ]
+
+    # Validate audio file
+    audio_exists = os.path.exists(audio_path) and os.path.getsize(audio_path) > 0
+    if not audio_exists:
         audio_filename = None
 
     return {
@@ -203,7 +239,8 @@ async def upload_local(file: UploadFile = File(...)):
         "video_url": f"http://localhost:8000/videos/{filename}",
         "audio_filename": audio_filename,
         "audio_url": f"http://localhost:8000/videos/{audio_filename}" if audio_filename else None,
-        "thumbnails": thumbnails
+        "thumbnails": thumbnails,
+        "thumbnail_count": len(thumbnails)
     }
 
 @app.post("/video/trim")
@@ -779,7 +816,7 @@ async def upload_audio(file: UploadFile = File(...)):
 class SplitScreenRequest(BaseModel):
     top_video: str
     bottom_video: str
-    audio_mode: str            # "top" | "bottom" | "external" | "mute"
+    audio_mode: str            # "top" | "bottom" | left| right "external" | "mute"
     audio_filename: str | None = None
 
 @app.post("/video/split-screen")
@@ -952,3 +989,949 @@ def final_merge(req: FinalMergeRequest):
         import traceback
         traceback.print_exc()
         return JSONResponse(status_code=400, content={"error": str(e)})
+    
+
+# =====================================================
+# MULTIPLE VIDEO INSERT MODELS
+# =====================================================
+
+class VideoInsertConfig(BaseModel):
+    """Configuration for a single video insert/overlay"""
+    insert_filename: str       # The video to insert
+    start_time: float          # When insert appears (seconds)
+    end_time: Optional[float] = None  # When insert disappears (auto-detect if None)
+    x: int                     # X position (pixels from left)
+    y: int                     # Y position (pixels from top)
+    width: int                 # Insert width
+    height: int                # Insert height
+    opacity: float = 1.0       # 0.0 to 1.0
+    volume: float = 0.5        # 0.0 to 1.0 (insert audio volume)
+    z_index: int = 1           # Layer order (higher = on top)
+    loop: bool = False         # Loop insert video if shorter than duration
+    fade_in: float = 0.0       # Fade in duration (seconds)
+    fade_out: float = 0.0      # Fade out duration (seconds)
+
+class MultipleVideoInsertRequest(BaseModel):
+    """Request to add multiple video inserts to main video"""
+    main_video: str                           # Main/base video filename
+    inserts: List[VideoInsertConfig]          # List of insert configurations
+    output_name: Optional[str] = None         # Optional output filename
+    keep_main_audio: bool = True              # Keep main video audio
+    mix_insert_audio: bool = False            # Mix insert audio with main
+    background_color: str = "black"           # Background color if needed
+
+# =====================================================
+# HELPER FUNCTIONS
+# =====================================================
+
+def get_video_info(video_path: str) -> dict:
+    """Get video metadata using ffprobe"""
+    probe_cmd = [
+        r"E:\ffmpeg\bin\ffprobe.exe",
+        "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height,duration,avg_frame_rate",
+        "-show_entries", "format=duration",
+        "-of", "json",
+        video_path
+    ]
+    
+    result = subprocess.run(probe_cmd, capture_output=True, text=True, check=True)
+    data = json.loads(result.stdout)
+    
+    stream = data['streams'][0]
+    format_data = data.get('format', {})
+    
+    return {
+        "width": int(stream['width']),
+        "height": int(stream['height']),
+        "duration": float(format_data.get('duration', stream.get('duration', 0))),
+        "frame_rate": stream.get('avg_frame_rate', '30/1')
+    }
+
+def build_fade_filter(insert_label: str, fade_in: float, fade_out: float, 
+                      start_time: float, end_time: float) -> str:
+    """Build fade in/out filter for an insert"""
+    filters = []
+    
+    if fade_in > 0:
+        # Fade in at the start
+        filters.append(f"fade=t=in:st={start_time}:d={fade_in}")
+    
+    if fade_out > 0:
+        # Fade out before end
+        fade_start = end_time - fade_out
+        filters.append(f"fade=t=out:st={fade_start}:d={fade_out}")
+    
+    if filters:
+        return f"[{insert_label}]{','.join(filters)}[{insert_label}_faded]"
+    
+    return None
+
+# =====================================================
+# MAIN ENDPOINT: MULTIPLE VIDEO INSERTS
+# =====================================================
+
+@app.post("/video/add-multiple-inserts")
+def add_multiple_video_inserts(req: MultipleVideoInsertRequest):
+    """
+    Add multiple video inserts (Picture-in-Picture) to main video
+    
+    Features:
+    - Multiple inserts at different times and positions
+    - Z-index layering (control which video appears on top)
+    - Custom positioning, sizing, and opacity
+    - Audio mixing with volume control
+    - Fade in/out transitions
+    - Loop inserts if shorter than duration
+    - Timeline-based insertion
+    """
+    
+    try:
+        # =====================================================
+        # VALIDATION
+        # =====================================================
+        
+        main_path = os.path.join(UPLOAD_DIR, req.main_video)
+        if not os.path.exists(main_path):
+            return JSONResponse(
+                status_code=404, 
+                content={"error": "Main video not found"}
+            )
+        
+        # Get main video info
+        main_info = get_video_info(main_path)
+        main_duration = main_info['duration']
+        
+        print(f"📹 Main video: {req.main_video}")
+        print(f"   Dimensions: {main_info['width']}x{main_info['height']}")
+        print(f"   Duration: {main_duration:.2f}s")
+        
+        # Validate and process all inserts
+        processed_inserts = []
+        
+        for idx, insert in enumerate(req.inserts):
+            insert_path = os.path.join(UPLOAD_DIR, insert.insert_filename)
+            
+            if not os.path.exists(insert_path):
+                return JSONResponse(
+                    status_code=404,
+                    content={"error": f"Insert video not found: {insert.insert_filename}"}
+                )
+            
+            # Get insert video info
+            insert_info = get_video_info(insert_path)
+            
+            # Auto-detect end_time if not provided
+            if insert.end_time is None:
+                insert.end_time = min(
+                    insert.start_time + insert_info['duration'],
+                    main_duration
+                )
+            
+            # Validate times
+            if insert.start_time >= main_duration:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": f"Insert {idx+1} start_time ({insert.start_time}) exceeds main video duration ({main_duration})"}
+                )
+            
+            if insert.end_time > main_duration:
+                print(f"⚠️ Insert {idx+1} end_time adjusted from {insert.end_time} to {main_duration}")
+                insert.end_time = main_duration
+            
+            processed_inserts.append({
+                "config": insert,
+                "path": insert_path,
+                "info": insert_info,
+                "index": idx
+            })
+            
+            print(f"✅ Insert {idx+1}: {insert.insert_filename}")
+            print(f"   Time: {insert.start_time:.2f}s → {insert.end_time:.2f}s")
+            print(f"   Position: ({insert.x}, {insert.y})")
+            print(f"   Size: {insert.width}x{insert.height}")
+            print(f"   Z-Index: {insert.z_index}")
+        
+        # Sort inserts by z_index (lower z-index rendered first, appears behind)
+        processed_inserts.sort(key=lambda x: x['config'].z_index)
+        
+        # =====================================================
+        # GENERATE OUTPUT FILENAME
+        # =====================================================
+        
+        if req.output_name:
+            output_name = req.output_name
+        else:
+            output_name = f"multi_insert_{uuid.uuid4().hex}.mp4"
+        
+        output_path = os.path.join(UPLOAD_DIR, output_name)
+        
+        # =====================================================
+        # BUILD FFMPEG FILTER COMPLEX
+        # =====================================================
+        
+        input_files = ["-i", main_path]
+        filter_parts = []
+        audio_parts = []
+        
+        # Add all insert videos as inputs
+        for proc_insert in processed_inserts:
+            input_files.extend(["-i", proc_insert['path']])
+        
+        # Build video filters
+        current_base = "0:v"  # Start with main video
+        
+        for proc_insert in processed_inserts:
+            insert = proc_insert['config']
+            input_idx = proc_insert['index'] + 1  # Main is 0, inserts start at 1
+            
+            # =====================================================
+            # STEP 1: Scale insert to desired size
+            # =====================================================
+            
+            insert_label = f"insert{proc_insert['index']}"
+            scale_filter = f"[{input_idx}:v]scale={insert.width}:{insert.height}"
+            
+            # =====================================================
+            # STEP 2: Add looping if needed
+            # =====================================================
+            
+            insert_duration = insert.end_time - insert.start_time
+            video_duration = proc_insert['info']['duration']
+            
+            if insert.loop and video_duration < insert_duration:
+                # Loop the insert video
+                loop_count = int(insert_duration / video_duration) + 1
+                scale_filter += f",loop={loop_count}:1:0"
+            
+            scale_filter += f"[{insert_label}]"
+            filter_parts.append(scale_filter)
+            
+            # =====================================================
+            # STEP 3: Apply opacity if needed
+            # =====================================================
+            
+            working_label = insert_label
+            
+            if insert.opacity < 1.0:
+                opacity_label = f"{insert_label}_opacity"
+                opacity_filter = (
+                    f"[{working_label}]"
+                    f"format=yuva420p,colorchannelmixer=aa={insert.opacity}"
+                    f"[{opacity_label}]"
+                )
+                filter_parts.append(opacity_filter)
+                working_label = opacity_label
+            
+            # =====================================================
+            # STEP 4: Apply fade in/out if needed
+            # =====================================================
+            
+            if insert.fade_in > 0 or insert.fade_out > 0:
+                fade_label = f"{insert_label}_faded"
+                fade_filters = []
+                
+                if insert.fade_in > 0:
+                    fade_filters.append(f"fade=t=in:st=0:d={insert.fade_in}:alpha=1")
+                
+                if insert.fade_out > 0:
+                    fade_start = insert_duration - insert.fade_out
+                    fade_filters.append(f"fade=t=out:st={fade_start}:d={insert.fade_out}:alpha=1")
+                
+                fade_filter = (
+                    f"[{working_label}]{','.join(fade_filters)}[{fade_label}]"
+                )
+                filter_parts.append(fade_filter)
+                working_label = fade_label
+            
+            # =====================================================
+            # STEP 5: Overlay on current base
+            # =====================================================
+            
+            output_label = f"out{proc_insert['index']}"
+            
+            # Build overlay filter with time constraint
+            overlay_filter = (
+                f"[{current_base}][{working_label}]"
+                f"overlay=x={insert.x}:y={insert.y}:"
+                f"enable='between(t,{insert.start_time},{insert.end_time})'"
+            )
+            
+            # Check if this is the last insert
+            if proc_insert['index'] == len(processed_inserts) - 1:
+                output_label = "vout"
+            
+            overlay_filter += f"[{output_label}]"
+            filter_parts.append(overlay_filter)
+            
+            # Update current base for next overlay
+            current_base = output_label
+            
+            # =====================================================
+            # STEP 6: Audio handling
+            # =====================================================
+            
+            if req.mix_insert_audio and insert.volume > 0:
+                audio_label = f"audio{proc_insert['index']}"
+                
+                # Extract audio, adjust volume, and trim to insert duration
+                audio_filter = (
+                    f"[{input_idx}:a]"
+                    f"volume={insert.volume},"
+                    f"atrim=start={insert.start_time}:end={insert.end_time},"
+                    f"asetpts=PTS-STARTPTS"
+                    f"[{audio_label}]"
+                )
+                audio_parts.append(audio_label)
+                filter_parts.append(audio_filter)
+        
+        # =====================================================
+        # AUDIO MIXING
+        # =====================================================
+        
+        audio_map = []
+        
+        if req.keep_main_audio and req.mix_insert_audio and len(audio_parts) > 0:
+            # Mix main audio with all insert audios
+            
+            # Prepare main audio
+            filter_parts.append("[0:a]volume=1.0[main_audio]")
+            
+            # Build amix with all audio sources
+            all_audio_inputs = ["main_audio"] + audio_parts
+            amix_filter = (
+                f"[{']['.join(all_audio_inputs)}]"
+                f"amix=inputs={len(all_audio_inputs)}:"
+                f"duration=first:"
+                f"dropout_transition=2"
+                f"[aout]"
+            )
+            
+            filter_parts.append(amix_filter)
+            audio_map = ["-map", "[aout]"]
+            
+        elif req.keep_main_audio:
+            # Keep only main video audio
+            audio_map = ["-map", "0:a"]
+            
+        else:
+            # No audio
+            audio_map = ["-an"]
+        
+        # =====================================================
+        # COMBINE FILTERS
+        # =====================================================
+        
+        filter_complex = ";".join(filter_parts)
+        
+        # =====================================================
+        # BUILD FFMPEG COMMAND
+        # =====================================================
+        
+        ffmpeg_cmd = [
+            FFMPEG_PATH,
+            "-y",
+            *input_files,
+            "-filter_complex", filter_complex,
+            "-map", "[vout]",
+            *audio_map,
+            "-c:v", "libx264",
+            "-preset", "medium",
+            "-crf", "23",
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",  # Enable fast start for web playback
+        ]
+        
+        # Add audio codec if audio is included
+        if audio_map != ["-an"]:
+            ffmpeg_cmd.extend(["-c:a", "aac", "-b:a", "192k"])
+        
+        ffmpeg_cmd.append(output_path)
+        
+        # =====================================================
+        # EXECUTE FFMPEG
+        # =====================================================
+        
+        print("=" * 80)
+        print("MULTIPLE VIDEO INSERTS COMMAND")
+        print("=" * 80)
+        print(" ".join(ffmpeg_cmd))
+        print("=" * 80)
+        print("\nFILTER COMPLEX:")
+        print(filter_complex)
+        print("=" * 80)
+        
+        result = subprocess.run(
+            ffmpeg_cmd,
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        
+        print("✅ Multiple video inserts successful")
+        
+        return {
+            "message": "Multiple video inserts added successfully",
+            "output": output_name,
+            "video_url": f"http://localhost:8000/videos/{output_name}",
+            "inserts_count": len(processed_inserts),
+            "main_video_duration": main_duration,
+            "inserts_summary": [
+                {
+                    "filename": p['config'].insert_filename,
+                    "time_range": f"{p['config'].start_time:.2f}s - {p['config'].end_time:.2f}s",
+                    "position": f"({p['config'].x}, {p['config'].y})",
+                    "size": f"{p['config'].width}x{p['config'].height}",
+                    "z_index": p['config'].z_index
+                }
+                for p in processed_inserts
+            ]
+        }
+        
+    except subprocess.CalledProcessError as e:
+        print("❌ FFmpeg Error:")
+        print(e.stderr)
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": f"FFmpeg failed: {e.stderr[:500]}",
+                "full_error": e.stderr
+            }
+        )
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(
+            status_code=400,
+            content={"error": str(e)}
+        )
+
+# =====================================================
+# VIDEO INSERT (SPLIT & CONCATENATE)
+# =====================================================
+
+class VideoInsertAtPositionRequest(BaseModel):
+    """Request to insert video(s) at specific positions in main video"""
+    main_video: str                    # Main video filename
+    inserts: List[dict]                # [{"filename": "clip.mp4", "position": 25.0}, ...]
+    output_name: Optional[str] = None
+
+@app.post("/video/insert-at-position")
+def insert_video_at_position(req: VideoInsertAtPositionRequest):
+    """
+    Fast video insert using single-pass filter_complex.
+    """
+    
+    temp_files = []  # Initialize at the top for cleanup
+    
+    try:
+        main_path = os.path.join(UPLOAD_DIR, req.main_video)
+        if not os.path.exists(main_path):
+            return JSONResponse(
+                status_code=404,
+                content={"error": "Main video not found"}
+            )
+        
+        # Get main video info
+        main_info = get_video_info(main_path)
+        main_duration = main_info['duration']
+        target_width = main_info['width']
+        target_height = main_info['height']
+        
+        print(f"📹 Main video: {req.main_video}")
+        print(f"   Duration: {main_duration:.2f}s")
+        print(f"   Resolution: {target_width}x{target_height}")
+        
+        # =====================================================
+        # STEP 1: Validate and sort inserts
+        # =====================================================
+        
+        validated_inserts = []
+        
+        for insert in req.inserts:
+            insert_path = os.path.join(UPLOAD_DIR, insert['filename'])
+            
+            if not os.path.exists(insert_path):
+                return JSONResponse(
+                    status_code=404,
+                    content={"error": f"Insert video not found: {insert['filename']}"}
+                )
+            
+            insert_info = get_video_info(insert_path)
+            position = float(insert['position'])
+            
+            if position < 0 or position > main_duration:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": f"Invalid position {position}. Must be 0-{main_duration}"}
+                )
+            
+            validated_inserts.append({
+                'filename': insert['filename'],
+                'path': insert_path,
+                'position': position,
+                'duration': insert_info['duration'],
+                'width': insert_info['width'],
+                'height': insert_info['height']
+            })
+            
+            print(f"✅ Insert: {insert['filename']} at {position}s")
+        
+        # Sort by position
+        validated_inserts.sort(key=lambda x: x['position'])
+        
+        # =====================================================
+        # STEP 2: Build single-pass filter_complex
+        # =====================================================
+        
+        # Prepare input files
+        input_args = ["-i", main_path]
+        insert_input_map = {}
+        
+        for idx, insert in enumerate(validated_inserts):
+            input_args.extend(["-i", insert['path']])
+            insert_input_map[insert['position']] = idx + 1
+        
+        # Build filter chain
+        filter_parts = []
+        segment_labels = []
+        current_time = 0.0
+        segment_idx = 0
+        
+        for insert in validated_inserts:
+            insert_pos = insert['position']
+            insert_input_idx = insert_input_map[insert_pos]
+            
+            # Main video segment BEFORE insert
+            if insert_pos > current_time:
+                duration = insert_pos - current_time
+                
+                main_segment_label = f"main{segment_idx}"
+                filter_parts.append(
+                    f"[0:v]trim=start={current_time}:end={insert_pos},setpts=PTS-STARTPTS,"
+                    f"scale={target_width}:{target_height}:force_original_aspect_ratio=decrease,"
+                    f"pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2,setsar=1"
+                    f"[{main_segment_label}v]"
+                )
+                
+                filter_parts.append(
+                    f"[0:a]atrim=start={current_time}:end={insert_pos},asetpts=PTS-STARTPTS"
+                    f"[{main_segment_label}a]"
+                )
+                
+                segment_labels.append(f"[{main_segment_label}v][{main_segment_label}a]")
+                segment_idx += 1
+            
+            # Insert video
+            insert_segment_label = f"insert{segment_idx}"
+            
+            filter_parts.append(
+                f"[{insert_input_idx}:v]scale={target_width}:{target_height}:force_original_aspect_ratio=decrease,"
+                f"pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2,setsar=1"
+                f"[{insert_segment_label}v]"
+            )
+            
+            filter_parts.append(
+                f"[{insert_input_idx}:a]anull[{insert_segment_label}a]"
+            )
+            
+            segment_labels.append(f"[{insert_segment_label}v][{insert_segment_label}a]")
+            segment_idx += 1
+            
+            current_time = insert_pos
+        
+        # Remaining main video after last insert
+        if current_time < main_duration:
+            main_final_label = f"main{segment_idx}"
+            
+            filter_parts.append(
+                f"[0:v]trim=start={current_time},setpts=PTS-STARTPTS,"
+                f"scale={target_width}:{target_height}:force_original_aspect_ratio=decrease,"
+                f"pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2,setsar=1"
+                f"[{main_final_label}v]"
+            )
+            
+            filter_parts.append(
+                f"[0:a]atrim=start={current_time},asetpts=PTS-STARTPTS"
+                f"[{main_final_label}a]"
+            )
+            
+            segment_labels.append(f"[{main_final_label}v][{main_final_label}a]")
+        
+        # Concatenate all segments
+        concat_inputs = "".join(segment_labels)
+        filter_parts.append(
+            f"{concat_inputs}concat=n={len(segment_labels)}:v=1:a=1[outv][outa]"
+        )
+        
+        # Combine all filters
+        filter_complex = ";".join(filter_parts)
+        
+        # =====================================================
+        # STEP 3: Single FFmpeg command
+        # =====================================================
+        
+        if req.output_name:
+            output_name = req.output_name
+        else:
+            output_name = f"inserted_{uuid.uuid4().hex}.mp4"
+        
+        output_path = os.path.join(UPLOAD_DIR, output_name)
+        
+        ffmpeg_cmd = [
+            FFMPEG_PATH,
+            "-y",
+            *input_args,
+            "-filter_complex", filter_complex,
+            "-map", "[outv]",
+            "-map", "[outa]",
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-crf", "23",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-movflags", "+faststart",
+            output_path
+        ]
+        
+        print("=" * 80)
+        print("SINGLE-PASS VIDEO INSERT")
+        print("=" * 80)
+        print(f"Segments to process: {len(segment_labels)}")
+        print(f"Preset: ultrafast")
+        print("=" * 80)
+        
+        # Execute
+        result = subprocess.run(
+            ffmpeg_cmd,
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        
+        # Get final info
+        final_info = get_video_info(output_path)
+        final_duration = final_info['duration']
+        
+        print(f"✅ Single-pass insert complete!")
+        print(f"   Original: {main_duration:.2f}s")
+        print(f"   Final: {final_duration:.2f}s")
+        
+        return {
+            "message": "Video insert successful",
+            "output": output_name,
+            "video_url": f"http://localhost:8000/videos/{output_name}",
+            "original_duration": main_duration,
+            "final_duration": final_duration,
+            "resolution": f"{final_info['width']}x{final_info['height']}",
+            "inserts_count": len(validated_inserts)
+        }
+    
+    # ✅ HERE IS THE REQUIRED EXCEPT BLOCK
+    except subprocess.CalledProcessError as e:
+        print("❌ FFmpeg Error:")
+        print(e.stderr[-2000:] if e.stderr else "No error output")
+        
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": "FFmpeg processing failed",
+                "details": e.stderr[-1000:] if e.stderr else "No details"
+            }
+        )
+    
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        
+        return JSONResponse(
+            status_code=400,
+            content={"error": str(e)}
+        )
+    
+    # =====================================================
+# IMAGE OVERLAY MODELS
+# =====================================================
+
+class ImageOverlay(BaseModel):
+    """Single image overlay configuration"""
+    image_filename: str           # Image file to overlay
+    start: float                  # When image appears (seconds)
+    end: float                    # When image disappears (seconds)
+    x: int                        # X position (pixels from left)
+    y: int                        # Y position (pixels from top)
+    width: int                    # Image width
+    height: int                   # Image height
+    opacity: float = 1.0          # 0.0 to 1.0
+    fade_in: float = 0.0          # Fade in duration (seconds)
+    fade_out: float = 0.0         # Fade out duration (seconds)
+
+class AddImageOverlaysRequest(BaseModel):
+    """Request to add multiple image overlays to video"""
+    filename: str                          # Main video filename
+    overlays: List[ImageOverlay]           # List of image overlays
+    output_name: Optional[str] = None
+
+# =====================================================
+# IMAGE OVERLAY ENDPOINT
+# =====================================================
+
+@app.post("/video/add-image-overlays")
+def add_image_overlays(req: AddImageOverlaysRequest):
+    """
+    Add multiple image overlays to video.
+    
+    Features:
+    - Multiple images at different times
+    - Custom positioning and sizing
+    - Opacity control
+    - Fade in/out transitions
+    - Timeline-based display
+    
+    Example:
+    - Add logo in corner from 0-10s
+    - Add watermark from 20-30s
+    - Add sticker from 5-15s
+    """
+    
+    try:
+        # =====================================================
+        # VALIDATION
+        # =====================================================
+        
+        video_path = os.path.join(UPLOAD_DIR, req.filename)
+        if not os.path.exists(video_path):
+            return JSONResponse(
+                status_code=404,
+                content={"error": "Video file not found"}
+            )
+        
+        # Get video info
+        video_info = get_video_info(video_path)
+        video_duration = video_info['duration']
+        
+        print(f"📹 Video: {req.filename}")
+        print(f"   Duration: {video_duration:.2f}s")
+        print(f"   Resolution: {video_info['width']}x{video_info['height']}")
+        
+        # Validate image overlays
+        validated_overlays = []
+        
+        for idx, overlay in enumerate(req.overlays):
+            image_path = os.path.join(UPLOAD_DIR, overlay.image_filename)
+            
+            if not os.path.exists(image_path):
+                return JSONResponse(
+                    status_code=404,
+                    content={"error": f"Image not found: {overlay.image_filename}"}
+                )
+            
+            # Validate time range
+            if overlay.start >= video_duration:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": f"Overlay {idx+1} start time exceeds video duration"}
+                )
+            
+            if overlay.end > video_duration:
+                print(f"⚠️ Overlay {idx+1} end time adjusted to video duration")
+                overlay.end = video_duration
+            
+            validated_overlays.append({
+                'config': overlay,
+                'path': image_path,
+                'index': idx
+            })
+            
+            print(f"✅ Image overlay {idx+1}: {overlay.image_filename}")
+            print(f"   Time: {overlay.start:.2f}s → {overlay.end:.2f}s")
+            print(f"   Position: ({overlay.x}, {overlay.y})")
+            print(f"   Size: {overlay.width}x{overlay.height}")
+        
+        # =====================================================
+        # BUILD FFMPEG FILTER COMPLEX
+        # =====================================================
+        
+        # Start with video input
+        filter_parts = []
+        current_video_label = "0:v"
+        
+        for proc_overlay in validated_overlays:
+            overlay = proc_overlay['config']
+            input_idx = proc_overlay['index'] + 1  # Video is input 0
+            
+            overlay_label = f"img{proc_overlay['index']}"
+            
+            # =====================================================
+            # STEP 1: Scale and format image
+            # =====================================================
+            
+            scale_filter = (
+                f"[{input_idx}:v]"
+                f"scale={overlay.width}:{overlay.height},"
+                f"format=yuva420p"  # Format with alpha channel
+                f"[{overlay_label}_scaled]"
+            )
+            filter_parts.append(scale_filter)
+            
+            working_label = f"{overlay_label}_scaled"
+            
+            # =====================================================
+            # STEP 2: Apply opacity
+            # =====================================================
+            
+            if overlay.opacity < 1.0:
+                opacity_label = f"{overlay_label}_opacity"
+                opacity_filter = (
+                    f"[{working_label}]"
+                    f"colorchannelmixer=aa={overlay.opacity}"
+                    f"[{opacity_label}]"
+                )
+                filter_parts.append(opacity_filter)
+                working_label = opacity_label
+            
+            # =====================================================
+            # STEP 3: Apply fade in/out
+            # =====================================================
+            
+            if overlay.fade_in > 0 or overlay.fade_out > 0:
+                fade_label = f"{overlay_label}_faded"
+                fade_filters = []
+                
+                if overlay.fade_in > 0:
+                    fade_filters.append(
+                        f"fade=t=in:st=0:d={overlay.fade_in}:alpha=1"
+                    )
+                
+                if overlay.fade_out > 0:
+                    duration = overlay.end - overlay.start
+                    fade_start = duration - overlay.fade_out
+                    fade_filters.append(
+                        f"fade=t=out:st={fade_start}:d={overlay.fade_out}:alpha=1"
+                    )
+                
+                fade_filter = (
+                    f"[{working_label}]{','.join(fade_filters)}[{fade_label}]"
+                )
+                filter_parts.append(fade_filter)
+                working_label = fade_label
+            
+            # =====================================================
+            # STEP 4: Overlay on video
+            # =====================================================
+            
+            output_label = f"v{proc_overlay['index']}"
+            
+            # Build overlay filter with time constraint
+            overlay_filter = (
+                f"[{current_video_label}][{working_label}]"
+                f"overlay=x={overlay.x}:y={overlay.y}:"
+                f"enable='between(t,{overlay.start},{overlay.end})'"
+            )
+            
+            # Check if this is the last overlay
+            if proc_overlay['index'] == len(validated_overlays) - 1:
+                output_label = "vout"
+            
+            overlay_filter += f"[{output_label}]"
+            filter_parts.append(overlay_filter)
+            
+            # Update current video label for next overlay
+            current_video_label = output_label
+        
+        # Combine filters
+        filter_complex = ";".join(filter_parts)
+        
+        # =====================================================
+        # BUILD FFMPEG COMMAND
+        # =====================================================
+        
+        # Prepare inputs (video + all images)
+        input_args = ["-i", video_path]
+        for proc_overlay in validated_overlays:
+            input_args.extend(["-loop", "1", "-i", proc_overlay['path']])
+        
+        # Generate output filename
+        if req.output_name:
+            output_name = req.output_name
+        else:
+            output_name = f"img_overlay_{uuid.uuid4().hex}.mp4"
+        
+        output_path = os.path.join(UPLOAD_DIR, output_name)
+        
+        ffmpeg_cmd = [
+            FFMPEG_PATH,
+            "-y",
+            *input_args,
+            "-filter_complex", filter_complex,
+            "-map", "[vout]",
+            "-map", "0:a",  # Keep original audio
+            "-c:v", "libx264",
+            "-preset", "medium",
+            "-crf", "23",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-movflags", "+faststart",
+            "-shortest",  # End when video ends
+            output_path
+        ]
+        
+        print("=" * 80)
+        print("IMAGE OVERLAY COMMAND")
+        print("=" * 80)
+        print(" ".join(ffmpeg_cmd))
+        print("=" * 80)
+        print("\nFILTER COMPLEX:")
+        print(filter_complex)
+        print("=" * 80)
+        
+        # Execute FFmpeg
+        result = subprocess.run(
+            ffmpeg_cmd,
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        
+        print("✅ Image overlays added successfully")
+        
+        return {
+            "message": "Image overlays added successfully",
+            "output": output_name,
+            "video_url": f"http://localhost:8000/videos/{output_name}",
+            "overlays_count": len(validated_overlays),
+            "video_duration": video_duration,
+            "overlays_summary": [
+                {
+                    "image": p['config'].image_filename,
+                    "time_range": f"{p['config'].start:.2f}s - {p['config'].end:.2f}s",
+                    "position": f"({p['config'].x}, {p['config'].y})",
+                    "size": f"{p['config'].width}x{p['config'].height}",
+                    "opacity": p['config'].opacity
+                }
+                for p in validated_overlays
+            ]
+        }
+        
+    except subprocess.CalledProcessError as e:
+        print("❌ FFmpeg Error:")
+        print(e.stderr)
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": f"FFmpeg failed: {e.stderr[:500]}",
+                "full_error": e.stderr
+            }
+        )
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(
+            status_code=400,
+            content={"error": str(e)}
+        )
