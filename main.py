@@ -1,15 +1,14 @@
-from fastapi import FastAPI, UploadFile, File, Form 
+from fastapi import FastAPI, UploadFile, File, Form,HTTPException,BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse,FileResponse
+from fastapi.staticfiles import StaticFiles 
 import yt_dlp
-import os
-import shutil
+import os 
 import glob
 import re
 import unicodedata
 from fastapi.responses import StreamingResponse 
-from pydantic import BaseModel
+from pydantic import BaseModel,Field
 import subprocess
 import uuid
 from typing import List,Optional,Literal 
@@ -17,6 +16,8 @@ import json
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import aiofiles
+import shutil
+from pathlib import Path
 
 
 app = FastAPI()
@@ -81,7 +82,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_DIR = os.path.join(BASE_DIR, "videouploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-UPLOAD_DIREC = r"E:\videoed\backend\ven\videouploads"
+UPLOAD_DIREC = r"E:\videoed-backend\videouploads"
 FFMPEG_PATH = r"E:\ffmpeg\bin\ffmpeg.exe"
 
 # ---- Serve uploaded videos ----
@@ -148,99 +149,219 @@ def delete_to_keep_ranges(delete_ranges: List[dict], total_duration: float) -> L
 # -----------------------------
 @app.post("/upload/local")
 async def upload_local(file: UploadFile = File(...)):
-    filename = safe_filename(file.filename)
-    file_path = os.path.join(UPLOAD_DIR, filename)
-
-    # ✅ OPTIMIZATION 1: Async file saving
-    # Stream file in chunks instead of copying all at once
-    async with aiofiles.open(file_path, 'wb') as f:
-        while chunk := await file.read(1024 * 1024):  # 1MB chunks
-            await f.write(chunk)
-
-    # ✅ OPTIMIZATION 2: Run thumbnails and audio extraction in PARALLEL
-    # Instead of sequential (thumb → audio), do both at same time
+    """
+    Smart upload endpoint that handles videos, images, and audio.
+    Preserves original file extensions and processes based on file type.
+    """
     
-    thumb_dir = os.path.join(UPLOAD_DIR, f"{filename}_thumbs")
-    os.makedirs(thumb_dir, exist_ok=True)
-    thumb_pattern = os.path.join(thumb_dir, "thumb_%04d.jpg")
-    
-    base_name = os.path.splitext(filename)[0]
-    audio_filename = base_name + "_audio.m4a"
-    audio_path = os.path.join(UPLOAD_DIR, audio_filename)
-
-    # ✅ Run both FFmpeg tasks in parallel
-    async def generate_thumbnails():
-        """Async thumbnail generation"""
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            executor,
-            subprocess.run,
-            [
-                r"E:\ffmpeg\bin\ffmpeg.exe",
-                "-y",
-                "-i", file_path,
-                "-vf", "fps=1,scale=160:-1",
-                "-q:v", "5",  # ✅ Lower quality = faster
-                "-threads", "2",  # ✅ Use 2 CPU cores
-                thumb_pattern
-            ],
-            True,  # capture_output
-            True   # text
+    try:
+        # =====================================================
+        # STEP 1: Detect file type
+        # =====================================================
+        VIDEO_FORMATS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.flv', '.wmv'}
+        IMAGE_FORMATS = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp'}
+        AUDIO_FORMATS = {'.mp3', '.wav', '.aac', '.m4a', '.ogg', '.flac'}
+        
+        file_extension = Path(file.filename).suffix.lower()
+        
+        if file_extension in VIDEO_FORMATS:
+            file_type = "video"
+        elif file_extension in IMAGE_FORMATS:
+            file_type = "image"
+        elif file_extension in AUDIO_FORMATS:
+            file_type = "audio"
+        else:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": f"Unsupported file format '{file_extension}'",
+                    "supported": {
+                        "video": list(VIDEO_FORMATS),
+                        "image": list(IMAGE_FORMATS),
+                        "audio": list(AUDIO_FORMATS)
+                    }
+                }
+            )
+        
+        # =====================================================
+        # STEP 2: Sanitize filename (PRESERVE EXTENSION!)
+        # =====================================================
+        original_name = file.filename
+        
+        # Sanitize without changing extension
+        sanitized_name = unicodedata.normalize("NFKD", original_name)
+        sanitized_name = sanitized_name.encode("ascii", "ignore").decode("ascii")
+        sanitized_name = re.sub(r'[<>:"/\\|?*]', "", sanitized_name)
+        sanitized_name = sanitized_name.replace(" ", "_")
+        
+        # Ensure we have a valid filename
+        if not sanitized_name or sanitized_name == file_extension:
+            sanitized_name = f"{file_type}_{uuid.uuid4().hex}{file_extension}"
+        
+        filename = sanitized_name  # ✅ Preserved extension!
+        file_path = os.path.join(UPLOAD_DIR, filename)
+        
+        print(f"📤 Uploading {file_type}: {original_name} → {filename}")
+        
+        # =====================================================
+        # STEP 3: Save file (async chunked)
+        # =====================================================
+        async with aiofiles.open(file_path, 'wb') as f:
+            while chunk := await file.read(1024 * 1024):  # 1MB chunks
+                await f.write(chunk)
+        
+        # =====================================================
+        # STEP 4: Type-specific processing
+        # =====================================================
+        
+        response_data = {
+            "message": f"{file_type.capitalize()} uploaded successfully",
+            "filename": filename,
+            "file_path": file_path,
+            "file_type": file_type,
+            "video_url": f"http://localhost:8000/videos/{filename}",  # Works for all types
+            "file_size_mb": round(os.path.getsize(file_path) / (1024 * 1024), 2)
+        }
+        
+        # =====================================================
+        # VIDEO PROCESSING (thumbnails + audio extraction)
+        # =====================================================
+        if file_type == "video":
+            thumb_dir = os.path.join(UPLOAD_DIR, f"{filename}_thumbs")
+            os.makedirs(thumb_dir, exist_ok=True)
+            thumb_pattern = os.path.join(thumb_dir, "thumb_%04d.jpg")
+            
+            base_name = os.path.splitext(filename)[0]
+            audio_filename = base_name + "_audio.m4a"
+            audio_path = os.path.join(UPLOAD_DIR, audio_filename)
+            
+            # Parallel thumbnail + audio extraction
+            async def generate_thumbnails():
+                loop = asyncio.get_event_loop()
+                return await loop.run_in_executor(
+                    executor,
+                    subprocess.run,
+                    [
+                        FFMPEG_PATH,
+                        "-y",
+                        "-i", file_path,
+                        "-vf", "fps=1,scale=160:-1",
+                        "-q:v", "5",
+                        "-threads", "2",
+                        thumb_pattern
+                    ],
+                    True, True
+                )
+            
+            async def extract_audio():
+                loop = asyncio.get_event_loop()
+                return await loop.run_in_executor(
+                    executor,
+                    subprocess.run,
+                    [
+                        FFMPEG_PATH,
+                        "-y",
+                        "-i", file_path,
+                        "-vn",
+                        "-acodec", "copy",
+                        audio_path
+                    ],
+                    True, True
+                )
+            
+            # Run both in parallel
+            thumb_result, audio_result = await asyncio.gather(
+                generate_thumbnails(),
+                extract_audio(),
+                return_exceptions=True
+            )
+            
+            # Check results
+            if isinstance(thumb_result, Exception) or thumb_result.returncode != 0:
+                print(f"⚠️ Thumbnail generation failed: {thumb_result}")
+            
+            if isinstance(audio_result, Exception):
+                print(f"⚠️ Audio extraction failed: {audio_result}")
+            
+            # Collect thumbnails
+            thumbnails = [
+                f"http://localhost:8000/videos/{filename}_thumbs/{os.path.basename(f)}"
+                for f in sorted(glob.glob(os.path.join(thumb_dir, "thumb_*.jpg")))
+            ]
+            
+            # Validate audio
+            audio_exists = os.path.exists(audio_path) and os.path.getsize(audio_path) > 0
+            
+            response_data.update({
+                "thumbnails": thumbnails,
+                "thumbnail_count": len(thumbnails),
+                "audio_filename": audio_filename if audio_exists else None,
+                "audio_url": f"http://localhost:8000/videos/{audio_filename}" if audio_exists else None
+            })
+        
+        # =====================================================
+        # IMAGE PROCESSING (get dimensions)
+        # =====================================================
+        elif file_type == "image":
+            try:
+                # Optional: Get image metadata using PIL
+                from PIL import Image
+                with Image.open(file_path) as img:
+                    response_data.update({
+                        "width": img.width,
+                        "height": img.height,
+                        "format": img.format
+                    })
+                    print(f"   ✅ Image: {img.width}x{img.height} ({img.format})")
+            except ImportError:
+                # PIL not installed, skip metadata
+                print(f"   ✅ Image uploaded (metadata requires PIL)")
+            except Exception as e:
+                print(f"   ⚠️ Could not read image metadata: {e}")
+        
+        # =====================================================
+        # AUDIO PROCESSING (get duration)
+        # =====================================================
+        elif file_type == "audio":
+            try:
+                # Get audio duration using ffprobe
+                probe_cmd = [
+                    FFMPEG_PATH.replace("ffmpeg.exe", "ffprobe.exe"),
+                    "-v", "error",
+                    "-show_entries", "format=duration",
+                    "-of", "default=noprint_wrappers=1:nokey=1",
+                    file_path
+                ]
+                result = subprocess.run(probe_cmd, capture_output=True, text=True)
+                if result.returncode == 0:
+                    duration = float(result.stdout.strip())
+                    response_data["duration"] = round(duration, 2)
+                    print(f"   ✅ Audio: {duration:.2f}s")
+            except Exception as e:
+                print(f"   ⚠️ Could not read audio duration: {e}")
+        
+        print(f"✅ Upload complete: {filename}")
+        return response_data
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Upload failed: {str(e)}"}
         )
 
-    async def extract_audio():
-        """Async audio extraction"""
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            executor,
-            subprocess.run,
-            [
-                r"E:\ffmpeg\bin\ffmpeg.exe",
-                "-y",
-                "-i", file_path,
-                "-vn",
-                "-acodec", "copy",
-                audio_path
-            ],
-            True,  # capture_output
-            True   # text
-        )
-
-    # ✅ CRITICAL: Run both tasks in parallel (saves ~50% time)
-    thumb_result, audio_result = await asyncio.gather(
-        generate_thumbnails(),
-        extract_audio(),
-        return_exceptions=True  # Don't fail if one errors
-    )
-
-    # Check results
-    if isinstance(thumb_result, Exception) or thumb_result.returncode != 0:
-        print(f"⚠️ Thumbnail generation failed: {thumb_result}")
+@app.post("/upload")
+async def upload_video(file: UploadFile):
+    filepath = os.path.join(UPLOAD_DIR, file.filename)
     
-    if isinstance(audio_result, Exception):
-        print(f"⚠️ Audio extraction failed: {audio_result}")
-
-    # ✅ OPTIMIZATION 3: Faster thumbnail collection
-    # Use glob instead of listdir + filter
-    import glob
-    thumbnails = [
-        f"http://localhost:8000/videos/{filename}_thumbs/{os.path.basename(f)}"
-        for f in sorted(glob.glob(os.path.join(thumb_dir, "thumb_*.jpg")))
-    ]
-
-    # Validate audio file
-    audio_exists = os.path.exists(audio_path) and os.path.getsize(audio_path) > 0
-    if not audio_exists:
-        audio_filename = None
-
+    with open(filepath, "wb") as f:
+        content = await file.read()
+        f.write(content)
+    
     return {
-        "message": "File uploaded successfully",
-        "filename": filename,
-        "video_url": f"http://localhost:8000/videos/{filename}",
-        "audio_filename": audio_filename,
-        "audio_url": f"http://localhost:8000/videos/{audio_filename}" if audio_filename else None,
-        "thumbnails": thumbnails,
-        "thumbnail_count": len(thumbnails)
+        "filename": file.filename,
+        "filepath": filepath  # ✅ MUST return full path!
     }
 
 @app.post("/video/trim")
@@ -892,103 +1013,7 @@ def split_screen(req: SplitScreenRequest):
         "video_url": f"http://localhost:8000/videos/{output_name}"
     }
 
-# -----------------------------
-# Endpoint: Final Merge
-# -----------------------------
-@app.post("/video/final-merge")
-def final_merge(req: FinalMergeRequest):
-    try:
-        inputs = []
-        filter_complex = []
 
-        main_path = os.path.join(UPLOAD_DIR, req.main_video)
-        if not os.path.exists(main_path):
-            return JSONResponse(status_code=404, content={"error": "Main video not found"})
-        inputs.append(f"-i \"{main_path}\"")
-
-        # Optional secondary video for split-screen
-        if req.secondary_video and req.split_mode != "none":
-            sec_path = os.path.join(UPLOAD_DIR, req.secondary_video)
-            if not os.path.exists(sec_path):
-                return JSONResponse(status_code=404, content={"error": "Secondary video not found"})
-            inputs.append(f"-i \"{sec_path}\"")
-
-        # Optional external audio
-        if req.audio:
-            audio_path = os.path.join(UPLOAD_DIR, req.audio)
-            if not os.path.exists(audio_path):
-                return JSONResponse(status_code=404, content={"error": "Audio file not found"})
-            inputs.append(f"-i \"{audio_path}\"")
-
-        # -----------------------------
-        # Video filter
-        # -----------------------------
-        vout = "[vout]"
-        if req.secondary_video and req.split_mode == "vertical":
-            # stack vertically
-            filter_complex.append(f"[0:v]scale=1280:360[v0];[1:v]scale=1280:360[v1];[v0][v1]vstack=inputs=2{vout}")
-        elif req.secondary_video and req.split_mode == "horizontal":
-            # stack horizontally
-            filter_complex.append(f"[0:v]scale=640:720[v0];[1:v]scale=640:720[v1];[v0][v1]hstack=inputs=2{vout}")
-        else:
-            # single video
-            vout = "0:v"
-
-        # -----------------------------
-        # Text overlays
-        # -----------------------------
-        if req.text_overlays:
-            draw_filters = []
-            for o in req.text_overlays:
-                safe_text = o.text.replace("'", r"\'").replace(":", r'\:')
-                x_expr, y_expr = get_text_xy_expr(o.position, o.x, o.y)
-                draw_filters.append(
-                    f"drawtext=text='{safe_text}':x={x_expr}:y={y_expr}:fontsize={o.fontsize}:fontcolor={o.fontcolor}:box=1:boxcolor=black@0.4:enable='between(t,{o.start},{o.end})'"
-                )
-            # attach drawtext to main video or stacked video
-            drawtext_filter = ",".join(draw_filters)
-            if req.secondary_video != None:
-                filter_complex.append(f"{vout},{drawtext_filter}{vout}")
-            else:
-                filter_complex.append(f"[0:v]{drawtext_filter}{vout}")
-
-        # -----------------------------
-        # Audio mapping
-        # -----------------------------
-        audio_map = []
-        if req.audio:
-            # external audio mixed with main video
-            audio_map = ["-map", f"{len(inputs)-1}:a:0", "-map", f"0:a:0", "-filter_complex", "[0:a][1:a]amix=inputs=2[aout]", "-map", "[aout]"]
-        else:
-            audio_map = ["-map", f"{0}:a:0"]
-
-        # -----------------------------
-        # Output
-        # -----------------------------
-        output_name = req.output_name
-        output_path = os.path.join(UPLOAD_DIR, output_name)
-
-        ffmpeg_cmd = f'{FFMPEG_PATH} -y {" ".join(inputs)}'
-        if filter_complex:
-            ffmpeg_cmd += f' -filter_complex "{";".join(filter_complex)}"'
-        ffmpeg_cmd += " -c:v libx264 -c:a aac -b:a 192k -pix_fmt yuv420p "
-        if audio_map:
-            ffmpeg_cmd += " " + " ".join(audio_map)
-        ffmpeg_cmd += f' "{output_path}"'
-
-        print("FFMPEG CMD:", ffmpeg_cmd)
-        subprocess.run(ffmpeg_cmd, shell=True, check=True)
-
-        return {
-            "message": "Final merge successful",
-            "output": output_name,
-            "video_url": f"http://localhost:8000/videos/{output_name}"
-        }
-
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return JSONResponse(status_code=400, content={"error": str(e)})
     
 
 # =====================================================
@@ -1425,6 +1450,7 @@ def insert_video_at_position(req: VideoInsertAtPositionRequest):
     """
     
     temp_files = []  # Initialize at the top for cleanup
+
     
     try:
         main_path = os.path.join(UPLOAD_DIR, req.main_video)
@@ -1619,6 +1645,7 @@ def insert_video_at_position(req: VideoInsertAtPositionRequest):
         print(f"✅ Single-pass insert complete!")
         print(f"   Original: {main_duration:.2f}s")
         print(f"   Final: {final_duration:.2f}s")
+ 
         
         return {
             "message": "Video insert successful",
@@ -1652,7 +1679,7 @@ def insert_video_at_position(req: VideoInsertAtPositionRequest):
             content={"error": str(e)}
         )
     
-    # =====================================================
+ # =====================================================
 # IMAGE OVERLAY MODELS
 # =====================================================
 
@@ -1935,3 +1962,711 @@ def add_image_overlays(req: AddImageOverlaysRequest):
             status_code=400,
             content={"error": str(e)}
         )
+    
+ 
+# =====================================================
+# UNIFIED PIPELINE MODELS
+# =====================================================
+
+class TrimConfig(BaseModel):
+    """Trim/cut configuration"""
+    enabled: bool = False
+    cuts: List[dict] = []  # [{"start": 5.0, "end": 10.0}] - parts to DELETE
+
+class TextOverlayConfig(BaseModel):
+    """Text overlay configuration"""
+    text: str
+    start: float
+    end: float
+    position: Literal["center", "top", "bottom", "topleft", "custom"] = "custom"
+    x: Optional[float] = None
+    y: Optional[float] = None
+    fontsize: int = 24
+    fontcolor: str = "white"
+
+class TextOverlaysTask(BaseModel):
+    """Text overlays task"""
+    enabled: bool = False
+    overlays: List[TextOverlayConfig] = []
+
+class VideoInsertConfig(BaseModel):
+    """Video insert configuration"""
+    insert_filename: str
+    start_time: float
+    end_time: Optional[float] = None
+    x: float
+    y: float
+    width: float
+    height: float
+    opacity: float = 1.0
+    volume: float = 0.5
+    z_index: int = 1
+    loop: bool = False
+    fade_in: float = 0.0
+    fade_out: float = 0.0
+
+class MultipleInsertTask(BaseModel):
+    """Multiple video inserts task"""
+    enabled: bool = False
+    inserts: List[VideoInsertConfig] = []
+
+class ImageOverlayConfig(BaseModel):
+    """Image overlay configuration"""
+    image_filename: str
+    start: float
+    end: float
+    x: float
+    y: float
+    width: float
+    height: float
+    opacity: float = 1.0
+    fade_in: float = 0.0
+    fade_out: float = 0.0
+
+class ImageOverlaysTask(BaseModel):
+    """Image overlays task"""
+    enabled: bool = False
+    overlays: List[ImageOverlayConfig] = []
+
+class AudioControlTask(BaseModel):
+    """Audio control task"""
+    enabled: bool = False
+    mode: Literal["keep", "mute", "replace", "mix"] = "keep"
+    audio_filename: Optional[str] = None
+
+class SplitScreenTask(BaseModel):
+    """Split-screen task"""
+    enabled: bool = False
+    mode: Literal["horizontal", "vertical"] = "horizontal"
+    secondary_video: Optional[str] = None
+    audio_source: Literal["main", "secondary", "external", "mute"] = "main"
+    audio_filename: Optional[str] = None
+
+class VideoInsertAtPositionConfig(BaseModel):
+    """Insert video at specific timeline position"""
+    filename: str
+    position: float
+
+class InsertAtPositionTask(BaseModel):
+    """Insert videos at specific positions"""
+    enabled: bool = False
+    inserts: List[VideoInsertAtPositionConfig] = []
+
+class UnifiedPipelineRequest(BaseModel):
+    """
+    Unified video processing pipeline request.
+    At least ONE task must be enabled.
+    """
+    
+    main_video: str = Field(..., description="Main video filename")
+    output_name: Optional[str] = Field(None, description="Output filename")
+    
+    # Optional tasks
+    trim: Optional[TrimConfig] = None
+    text_overlays: Optional[TextOverlaysTask] = None
+    multiple_inserts: Optional[MultipleInsertTask] = None
+    image_overlays: Optional[ImageOverlaysTask] = None
+    audio_control: Optional[AudioControlTask] = None
+    split_screen: Optional[SplitScreenTask] = None
+    insert_at_position: Optional[InsertAtPositionTask] = None
+    
+    # Global settings
+    output_quality: Literal["ultrafast", "fast", "medium", "slow"] = "medium"
+    output_crf: int = Field(23, ge=0, le=51) 
+
+
+# =====================================================
+# UNIFIED PIPELINE ENGINE
+# =====================================================
+
+class UnifiedPipelineEngine:
+    """Core engine for unified video processing pipeline"""
+    # Supported file formats
+    SUPPORTED_VIDEO_FORMATS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.flv', '.wmv'}
+    SUPPORTED_IMAGE_FORMATS = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp'}
+    SUPPORTED_AUDIO_FORMATS = {'.mp3', '.wav', '.aac', '.m4a', '.ogg', '.flac'}
+
+    def __init__(self, upload_dir: str, ffmpeg_path: str):
+        self.upload_dir = upload_dir
+        self.ffmpeg_path = ffmpeg_path
+        self.temp_files = [] 
+    
+    def cleanup(self):
+        """Remove temporary files"""
+        for file in self.temp_files:
+            if os.path.exists(file):
+                try:
+                    os.remove(file)
+                except Exception as e:
+                    print(f"Warning: Could not remove {file}: {e}")
+
+    def validate_file_type(self, filename: str, expected_type: str) -> bool:
+        """
+        Validate file extension matches expected type
+        
+        Args:
+            filename: Name of the file
+            expected_type: 'video', 'image', or 'audio'
+        
+        Returns:
+            bool: True if valid, raises exception otherwise
+        """
+        file_extension = Path(filename).suffix.lower()
+        
+        if expected_type == 'video':
+            if file_extension not in self.SUPPORTED_VIDEO_FORMATS:
+                raise ValueError(
+                    f"Invalid video format '{file_extension}' for file '{filename}'. "
+                    f"Supported: {', '.join(self.SUPPORTED_VIDEO_FORMATS)}"
+                )
+        
+        elif expected_type == 'image':
+            if file_extension not in self.SUPPORTED_IMAGE_FORMATS:
+                raise ValueError(
+                    f"Invalid image format '{file_extension}' for file '{filename}'. "
+                    f"Supported: {', '.join(self.SUPPORTED_IMAGE_FORMATS)}"
+                )
+        
+        elif expected_type == 'audio':
+            if file_extension not in self.SUPPORTED_AUDIO_FORMATS:
+                raise ValueError(
+                    f"Invalid audio format '{file_extension}' for file '{filename}'. "
+                    f"Supported: {', '.join(self.SUPPORTED_AUDIO_FORMATS)}"
+                )
+        
+        return True     
+    
+               
+    
+    def get_video_duration(self, file_path: str) -> float:
+        """Get video duration"""
+        cmd = [
+            self.ffmpeg_path.replace("ffmpeg.exe", "ffprobe.exe"),
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            file_path
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise Exception(f"FFprobe failed: {result.stderr}")
+        return float(result.stdout.strip())
+    
+    def get_video_info(self, video_path: str) -> dict:
+        """Get comprehensive video metadata"""
+        probe_cmd = [
+            self.ffmpeg_path.replace("ffmpeg.exe", "ffprobe.exe"),
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height,duration",
+            "-show_entries", "format=duration",
+            "-of", "json",
+            video_path
+        ]
+        
+        result = subprocess.run(probe_cmd, capture_output=True, text=True, check=True)
+        data = json.loads(result.stdout)
+        
+        stream = data['streams'][0]
+        format_data = data.get('format', {})
+        
+        return {
+            "width": int(stream['width']),
+            "height": int(stream['height']),
+            "duration": float(format_data.get('duration', stream.get('duration', 0)))
+        }
+    
+    def delete_to_keep_ranges(self, delete_ranges: List[dict], total_duration: float) -> List[dict]:
+        """Convert DELETE ranges to KEEP ranges"""
+        if not delete_ranges:
+            return [{"start": 0, "end": total_duration}]
+        
+        delete_ranges.sort(key=lambda x: x["start"])
+        keep_ranges = []
+        current_start = 0.0
+        
+        for dr in delete_ranges:
+            if dr["start"] > current_start:
+                keep_ranges.append({"start": current_start, "end": dr["start"]})
+            current_start = max(current_start, dr["end"])
+        
+        if current_start < total_duration:
+            keep_ranges.append({"start": current_start, "end": total_duration})
+        
+        return keep_ranges
+    
+    def process_trim_task(self, main_path: str, trim_config: TrimConfig) -> str:
+        """TASK 1: Trim/Cut video"""
+        if not trim_config or not trim_config.enabled:
+            return main_path
+        
+        current_video = main_path   
+        video_info = self.get_video_info(current_video)
+        video_duration = video_info["duration"]
+
+        print("🔹 TASK 1: Processing TRIM")
+        
+        total_duration = self.get_video_duration(main_path)
+        delete_ranges = [{"start": c["start"], "end": c["end"]} for c in trim_config.cuts]
+        keep_ranges = self.delete_to_keep_ranges(delete_ranges, total_duration)
+        
+        if not keep_ranges:
+            raise Exception("Trim task would remove entire video")
+        
+        temp_segments = []
+        
+        for i, keep_range in enumerate(keep_ranges):
+            temp_name = f"trim_segment_{i}_{uuid.uuid4().hex}.mp4"
+            temp_path = os.path.join(self.upload_dir, temp_name)
+            
+            ffmpeg_cmd = [
+                self.ffmpeg_path, "-y",
+                "-ss", str(keep_range["start"]),
+                "-to", str(keep_range["end"]),
+                "-i", main_path,
+                "-map", "0",
+                "-vf", "setpts=PTS-STARTPTS",
+                "-af", "asetpts=PTS-STARTPTS",
+                "-c:v", "libx264",
+                "-preset", "ultrafast",
+                "-crf", "23",
+                "-c:a", "aac",
+                temp_path
+            ]
+            
+            subprocess.run(ffmpeg_cmd, check=True, capture_output=True)
+            temp_segments.append(temp_path)
+            self.temp_files.append(temp_path)
+        
+        # Concat segments
+        list_file = os.path.join(self.upload_dir, f"trim_concat_{uuid.uuid4().hex}.txt")
+        with open(list_file, "w") as f:
+            for segment in temp_segments:
+                f.write(f"file '{segment}'\n")
+        self.temp_files.append(list_file)
+        
+        trimmed_output = os.path.join(self.upload_dir, f"trimmed_{uuid.uuid4().hex}.mp4")
+        
+        concat_cmd = [
+            self.ffmpeg_path, "-y",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", list_file,
+            "-c", "copy",
+            trimmed_output
+        ]
+        
+        subprocess.run(concat_cmd, check=True, capture_output=True)
+        self.temp_files.append(trimmed_output)
+        
+        print(f"   ✅ Trimmed: {len(keep_ranges)} segments")
+        return trimmed_output
+    
+    def _get_text_xy_expr(self, pos: str, x: Optional[int], y: Optional[int]):
+        """Get text position expression"""
+        if pos == "center":
+            return "(w-text_w)/2", "(h-text_h)/2"
+        elif pos == "top":
+            return "(w-text_w)/2", "20"
+        elif pos == "bottom":
+            return "(w-text_w)/2", "h-text_h-20"
+        elif pos == "topleft":
+            return "20", "20"
+        elif pos == "custom":
+            return str(x or 50), str(y or 50)
+        return "20", "20"
+    
+    def build_filter_complex(self, main_path: str,video_duration, text_overlays, multiple_inserts, 
+                            image_overlays, split_screen) -> tuple:
+        """Build unified filter_complex for all visual tasks"""
+        
+        input_files = ["-i", main_path]
+        filter_parts = []
+        audio_inputs = []
+        current_video_label = "0:v"
+        input_index = 1
+        
+        # TASK 2: TEXT OVERLAYS
+        if text_overlays and text_overlays.enabled and text_overlays.overlays:
+            print(f"🔹 TASK 2: Processing TEXT OVERLAYS ({len(text_overlays.overlays)} overlays)")
+            
+            draw_filters = []
+            for overlay in text_overlays.overlays:
+                safe_text = overlay.text.replace("\\", r"\\").replace(":", r"\:").replace("'", r"\'")
+                x_expr, y_expr = self._get_text_xy_expr(overlay.position, overlay.x, overlay.y)
+                
+                draw_filters.append(
+                    f"drawtext=text='{safe_text}':"
+                    f"x={x_expr}:y={y_expr}:"
+                    f"fontsize={overlay.fontsize}:"
+                    f"fontcolor={overlay.fontcolor}:"
+                    f"box=1:boxcolor=black@0.4:"
+                    f"enable='between(t,{overlay.start},{overlay.end})'"
+                )
+            
+            text_filter = f"[{current_video_label}]{','.join(draw_filters)}[vtext]"
+            filter_parts.append(text_filter)
+            current_video_label = "vtext"
+        
+        # TASK 3: MULTIPLE VIDEO INSERTS
+        if multiple_inserts and multiple_inserts.enabled and multiple_inserts.inserts:
+            print(f"🔹 TASK 3: Processing VIDEO INSERTS ({len(multiple_inserts.inserts)} inserts)")
+            
+            sorted_inserts = sorted(multiple_inserts.inserts, key=lambda x: x.z_index)
+            
+            for idx, insert in enumerate(sorted_inserts):
+                insert_path = os.path.join(self.upload_dir, insert.insert_filename)
+                self.validate_file_type(insert.insert_filename, 'video')
+                input_files.extend(["-i", insert_path])
+                
+                insert_label = f"insert{idx}"
+                scale_filter = f"[{input_index}:v]scale={insert.width}:{insert.height}[{insert_label}]"
+                filter_parts.append(scale_filter)
+                
+                working_label = insert_label
+                
+                # Opacity
+                if insert.opacity < 1.0:
+                    opacity_label = f"{insert_label}_opacity"
+                    filter_parts.append(
+                        f"[{working_label}]format=yuva420p,colorchannelmixer=aa={insert.opacity}[{opacity_label}]"
+                    )
+                    working_label = opacity_label
+                
+                # Overlay
+                output_label = f"vpip{idx}"
+                end_time = insert.end_time if insert.end_time else 999999
+                
+                filter_parts.append(
+                    f"[{current_video_label}][{working_label}]"
+                    f"overlay=x={insert.x}:y={insert.y}:"
+                    f"enable='between(t,{insert.start_time},{end_time})'"
+                    f"[{output_label}]"
+                )
+                
+                current_video_label = output_label
+                input_index += 1
+        
+        # TASK 4: IMAGE OVERLAYS
+        if image_overlays and image_overlays.enabled and image_overlays.overlays:
+            print(f"🔹 TASK 4: Processing IMAGE OVERLAYS ({len(image_overlays.overlays)} images)")
+            
+            for idx, overlay in enumerate(image_overlays.overlays):
+                image_path = os.path.join(self.upload_dir, overlay.image_filename)
+                self.validate_file_type(overlay.image_filename, 'image')
+                # input_files.extend(["-loop", "1", "-i", image_path])
+                input_files.extend([
+                        "-loop", "1",
+                        "-t", str(video_duration),
+                        "-i", image_path
+                    ])
+                
+                img_label = f"img{idx}"
+                filter_parts.append(
+                    f"[{input_index}:v]scale={overlay.width}:{overlay.height},format=yuva420p[{img_label}_scaled]"
+                )
+                
+                working_label = f"{img_label}_scaled"
+                
+                if overlay.opacity < 1.0:
+                    opacity_label = f"{img_label}_opacity"
+                    filter_parts.append(
+                        f"[{working_label}]colorchannelmixer=aa={overlay.opacity}[{opacity_label}]"
+                    )
+                    working_label = opacity_label
+                
+                output_label = f"vimg{idx}"
+                filter_parts.append(
+                    f"[{current_video_label}][{working_label}]"
+                    f"overlay=x={overlay.x}:y={overlay.y}:"
+                    f"enable='between(t,{overlay.start},{overlay.end})'"
+                    f"[{output_label}]"
+                )
+                
+                current_video_label = output_label
+                input_index += 1
+        
+        # Final output
+        filter_parts.append(f"[{current_video_label}]null[vout]")
+        filter_complex = ";".join(filter_parts) if filter_parts else None
+        
+        return filter_complex, input_files, audio_inputs
+    
+    def process_audio_task(self, audio_control, audio_inputs) -> List[str]:
+        """TASK 5: Audio control"""
+        if not audio_control or not audio_control.enabled:
+            return ["-map", "0:a"]
+        
+        print(f"🔹 TASK 5: Processing AUDIO CONTROL (mode: {audio_control.mode})")
+        
+        if audio_control.mode == "mute":
+            return ["-an"]
+        elif audio_control.mode == "keep":
+            return ["-map", "0:a"]
+        elif audio_control.mode == "replace":
+            if not audio_control.audio_filename:
+                raise Exception("Audio filename required for replace mode")
+            self.validate_file_type(audio_control.audio_filename, 'audio')
+            return ["-map", "1:a"]  # Will be adjusted based on input index
+        
+        return ["-map", "0:a"]
+    
+    def execute_pipeline(self, request: UnifiedPipelineRequest) -> dict:
+        """Execute the complete unified pipeline"""
+        
+        try:
+            # Validate
+            main_path = os.path.join(self.upload_dir, request.main_video)
+            if not os.path.exists(main_path):
+                raise Exception(f"Main video not found: {request.main_video}")
+            self.validate_file_type(request.main_video, 'video')
+            
+            # Check enabled tasks
+            enabled_tasks = []
+            if request.trim and request.trim.enabled:
+                enabled_tasks.append("Trim")
+            if request.text_overlays and request.text_overlays.enabled:
+                enabled_tasks.append("Text Overlays")
+            if request.multiple_inserts and request.multiple_inserts.enabled:
+                enabled_tasks.append("Video Inserts")
+            if request.insert_at_position and getattr(request.insert_at_position, "enabled", False):
+                 enabled_tasks.append("Insert At Position")                
+            if request.image_overlays and request.image_overlays.enabled:
+                enabled_tasks.append("Image Overlays")
+            if request.audio_control and request.audio_control.enabled:
+                enabled_tasks.append("Audio Control")            
+            if not enabled_tasks:
+                raise Exception("No tasks enabled. Please enable at least one task.")
+            
+            print("=" * 80)
+            print("🎬 UNIFIED VIDEO PROCESSING PIPELINE")
+            print("=" * 80)
+            print(f"Main Video: {request.main_video}")
+            print(f"Enabled Tasks: {', '.join(enabled_tasks)}")
+            print("=" * 80)
+            
+            # TASK 1: Trim
+            current_video = self.process_trim_task(main_path, request.trim)
+            video_info = self.get_video_info(current_video)
+            video_duration = video_info["duration"]
+
+            # TASK 2: Insert At Position (runs after trim, before overlays)
+            if request.insert_at_position and getattr(request.insert_at_position, "enabled", False):
+                    print("🔹 TASK 2: Running Insert At Position Task")
+                    
+                    inserts_dicts = [
+                        {
+                            "filename": insert.filename,
+                            "position": insert.position
+                        }
+                        for insert in request.insert_at_position.inserts
+    ]
+                    # Create request for insert_video_at_position
+                    insert_req = VideoInsertAtPositionRequest(
+                        main_video=os.path.basename(current_video),  # Use basename since function expects filename
+                        inserts=inserts_dicts,
+                        output_name=None
+                    )
+                    
+                    # Execute insert at position
+                    result = insert_video_at_position(insert_req)
+                    
+                    # CRITICAL: Update current_video with the new output path
+                    # result["output"] is just the filename, need full path
+                    new_video_filename = result["output"]
+                    current_video = os.path.join(self.upload_dir, new_video_filename)
+                    
+                    # Add to temp files for cleanup
+                    self.temp_files.append(current_video)
+                    
+                    print(f"   ✅ Insert At Position complete. New video: {new_video_filename}")
+                
+                # Get video info for remaining tasks
+                    video_info = self.get_video_info(current_video)
+                    video_duration = video_info["duration"]
+            
+            # Build filter complex
+            filter_complex, input_files, audio_inputs = self.build_filter_complex(
+                current_video, video_duration,
+                request.text_overlays,
+                request.multiple_inserts,
+                request.image_overlays,
+                request.split_screen
+            )
+            
+            # Audio control
+            audio_args = self.process_audio_task(request.audio_control, audio_inputs)
+            
+            # Add external audio if needed
+            if request.audio_control and request.audio_control.enabled:
+                if request.audio_control.mode == "replace" and request.audio_control.audio_filename:
+                    audio_path = os.path.join(self.upload_dir, request.audio_control.audio_filename)
+                    input_files.extend(["-i", audio_path])
+                    # Update audio mapping to use last input
+                    audio_args = ["-map", f"{len(input_files)//2}:a"]
+            
+            # Output filename
+            output_name = request.output_name or f"final_{uuid.uuid4().hex}.mp4"
+            output_path = os.path.join(self.upload_dir, output_name)
+            
+            # Build FFmpeg command
+            ffmpeg_cmd = [self.ffmpeg_path, "-y", *input_files]
+            
+            if filter_complex:
+                ffmpeg_cmd.extend(["-filter_complex", filter_complex, "-map", "[vout]"])
+            else:
+                ffmpeg_cmd.extend(["-map", "0:v"])
+            
+            ffmpeg_cmd.extend(audio_args)
+            ffmpeg_cmd.extend([
+                "-c:v", "libx264",
+                "-preset", request.output_quality,
+                "-crf", str(request.output_crf),
+                "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart"
+            ])
+            
+            if "-an" not in audio_args:
+                ffmpeg_cmd.extend(["-c:a", "aac", "-b:a", "192k"])
+            
+            ffmpeg_cmd.append(output_path)
+            
+            print("=" * 80)
+            print("EXECUTING UNIFIED PIPELINE")
+            print("=" * 80)
+            
+            # Execute
+            subprocess.run(ffmpeg_cmd, capture_output=True, text=True, check=True)
+            
+            # Get output info
+            output_info = self.get_video_info(output_path)
+            
+            print("=" * 80)
+            print("✅ PIPELINE COMPLETED SUCCESSFULLY")
+            print("=" * 80)
+            
+            return {
+                "message": "Unified pipeline completed successfully",
+                "output": output_name,
+                "video_url": f"http://localhost:8000/videos/{output_name}",
+                "tasks_applied": enabled_tasks,
+                "output_info": {
+                    "duration": output_info['duration'],
+                    "width": output_info['width'],
+                    "height": output_info['height']
+                }
+            }
+            
+        finally:
+            self.cleanup()
+
+
+# =====================================================
+# UNIFIED PIPELINE ENDPOINT
+# Add this after your existing endpoints
+# =====================================================
+
+@app.post("/video/unified-pipeline")
+def unified_pipeline(request: UnifiedPipelineRequest):
+    """
+    🎬 UNIFIED VIDEO PROCESSING PIPELINE
+    
+    Consolidates all editing operations into single workflow.
+    At least ONE task must be enabled.
+    """
+    
+    engine = UnifiedPipelineEngine(UPLOAD_DIREC, FFMPEG_PATH)
+    
+    try:
+        result = engine.execute_pipeline(request)
+        return result
+        
+    except subprocess.CalledProcessError as e:
+        print("❌ FFmpeg Error:")
+        print(e.stderr)
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": "Pipeline execution failed",
+                "details": e.stderr[-1000:] if e.stderr else "No details"
+            }
+        )
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(
+            status_code=400,
+            content={"error": str(e)}
+        )
+
+@app.get("/video/download/{filename}")
+async def download_video(filename: str):
+    file_path = os.path.join("outputs", filename)
+    
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found")
+    
+    return FileResponse(
+        file_path,
+        media_type="application/octet-stream",  # Forces download
+        filename=filename,
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-cache"
+        }
+    )
+
+class CleanupRequest(BaseModel):
+    filename: str
+    cleanup_uploads: bool = False
+    cleanup_outputs: bool = True
+
+ 
+
+@app.post("/video/cleanup")
+async def cleanup_files(data: dict, background_tasks: BackgroundTasks):
+    """Clean up files after download"""
+    filename = data.get("filename")
+    cleanup_uploads = data.get("cleanup_uploads", False)
+    cleanup_outputs = data.get("cleanup_outputs", True)
+    
+    deleted_files = []
+    
+    try:
+        # Delete output file (with delay to ensure download completes)
+        if cleanup_outputs and filename:
+            output_path = os.path.join("outputs", filename)
+            if os.path.exists(output_path):
+                background_tasks.add_task(delayed_delete, output_path, 3)
+                deleted_files.append(output_path)
+        
+        # Delete upload files if needed
+        if cleanup_uploads:
+            uploads_dir = "uploads"
+            if os.path.exists(uploads_dir):
+                for file in os.listdir(uploads_dir):
+                    file_path = os.path.join(uploads_dir, file)
+                    background_tasks.add_task(delayed_delete, file_path, 3)
+                    deleted_files.append(file_path)
+        
+        return {
+            "status": "success",
+            "message": "Cleanup scheduled",
+            "files_scheduled": deleted_files
+        }
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+async def delayed_delete(file_path: str, delay: int = 3):
+    """Delete file after a delay to ensure download completes"""
+    await asyncio.sleep(delay)
+    try:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+            print(f"✅ Deleted: {file_path}")
+    except Exception as e:
+        print(f"❌ Failed to delete {file_path}: {e}")
+
+    
