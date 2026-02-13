@@ -960,11 +960,11 @@ def split_screen(req: SplitScreenRequest):
     output_name = f"split_{uuid.uuid4().hex}.mp4"
     output_path = os.path.join(UPLOAD_DIR, output_name)
 
-    # ---------------- VIDEO FILTER ----------------
-    # Resize both to half height and stack vertically
+    # ✅ FIXED: Preserve aspect ratio with padding (black bars)
+    # Target: 1280x360 for each half
     video_filter = (
-        "[0:v]scale=1280:360[v0];"
-        "[1:v]scale=1280:360[v1];"
+        "[0:v]scale=1280:360:force_original_aspect_ratio=decrease,pad=1280:360:(ow-iw)/2:(oh-ih)/2:black[v0];"
+        "[1:v]scale=1280:360:force_original_aspect_ratio=decrease,pad=1280:360:(ow-iw)/2:(oh-ih)/2:black[v1];"
         "[v0][v1]vstack=inputs=2[vout]"
     )
 
@@ -999,8 +999,7 @@ def split_screen(req: SplitScreenRequest):
 
     ffmpeg_cmd += [
         "-c:v", "libx264",
-        "-c:a", "aac",
-        "-shortest",   # keep in sync safely
+        "-c:a", "aac", 
         output_path
     ]
 
@@ -2434,7 +2433,7 @@ class UnifiedPipelineEngine:
             if request.image_overlays and request.image_overlays.enabled:
                 enabled_tasks.append("Image Overlays")
             if request.audio_control and request.audio_control.enabled:
-                enabled_tasks.append("Audio Control")            
+                enabled_tasks.append("Audio Control")  
             if not enabled_tasks:
                 raise Exception("No tasks enabled. Please enable at least one task.")
             
@@ -2501,9 +2500,10 @@ class UnifiedPipelineEngine:
             if request.audio_control and request.audio_control.enabled:
                 if request.audio_control.mode == "replace" and request.audio_control.audio_filename:
                     audio_path = os.path.join(self.upload_dir, request.audio_control.audio_filename)
+                    audio_input_index = len(input_files) // 2
                     input_files.extend(["-i", audio_path])
                     # Update audio mapping to use last input
-                    audio_args = ["-map", f"{len(input_files)//2}:a"]
+                    audio_args = ["-map", f"{audio_input_index}:a"]
             
             # Output filename
             output_name = request.output_name or f"final_{uuid.uuid4().hex}.mp4"
