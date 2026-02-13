@@ -1,13 +1,12 @@
 from fastapi import FastAPI, UploadFile, File, Form,HTTPException,BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse,FileResponse
+from fastapi.responses import JSONResponse,FileResponse,StreamingResponse
 from fastapi.staticfiles import StaticFiles 
 import yt_dlp
 import os 
 import glob
 import re
 import unicodedata
-from fastapi.responses import StreamingResponse 
 from pydantic import BaseModel,Field
 import subprocess
 import uuid
@@ -18,6 +17,9 @@ from concurrent.futures import ThreadPoolExecutor
 import aiofiles
 import shutil
 from pathlib import Path
+import cv2
+import io
+from PIL import Image
 
 
 app = FastAPI()
@@ -144,6 +146,81 @@ def delete_to_keep_ranges(delete_ranges: List[dict], total_duration: float) -> L
         keep_ranges.append({"start": current_start, "end": total_duration})
 
     return keep_ranges
+
+# video frames - virtual 
+@app.get("/video/frame/{filename}/{frame_index}")
+async def get_video_frame(filename: str, frame_index: int):
+    """Get a single frame from a video file at a specific second"""
+    try:
+        # Security check
+        if ".." in filename or "/" in filename or "\\" in filename:
+            raise HTTPException(status_code=400, detail="Invalid filename")
+        
+        # ✅ Use shared UPLOAD_DIR constant
+        video_path = Path(UPLOAD_DIR) / filename
+        
+        if not video_path.exists():
+            raise HTTPException(status_code=404, detail=f"Video not found: {filename}")
+        
+        # Open video
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            raise HTTPException(status_code=500, detail="Failed to open video")
+        
+        try:
+            # Get metadata
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            duration = total_frames / fps if fps > 0 else 0
+            
+            # ✅ Validate time range
+            if frame_index < 0 or frame_index > duration:
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"Time {frame_index}s out of range (0-{duration:.2f}s)"
+                )
+            
+            # Convert seconds to frame number
+            actual_frame_number = int(frame_index * fps)
+            
+            # Read frame
+            cap.set(cv2.CAP_PROP_POS_FRAMES, actual_frame_number)
+            ret, frame = cap.read()
+            
+            if not ret:
+                raise HTTPException(status_code=500, detail="Failed to read frame")
+            
+        finally:
+            cap.release()  # ✅ Ensure cleanup
+        
+        # Convert and resize
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        pil_image = Image.fromarray(frame_rgb)
+        
+        max_width = 160
+        aspect_ratio = pil_image.height / pil_image.width
+        new_height = int(max_width * aspect_ratio)
+        pil_image = pil_image.resize((max_width, new_height), Image.Resampling.LANCZOS)
+        
+        # Convert to JPEG
+        img_byte_arr = io.BytesIO()
+        pil_image.save(img_byte_arr, format='JPEG', quality=85)
+        img_byte_arr.seek(0)
+        
+        return StreamingResponse(
+            img_byte_arr,
+            media_type="image/jpeg",
+            headers={
+                "Cache-Control": "public, max-age=31536000",
+                "Access-Control-Allow-Origin": "*",
+            }
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 # -----------------------------
 # Local file upload
 # -----------------------------
