@@ -12,3 +12,11 @@ videos/
 node_modules/
 dist/
 build/
+videouploads/
+outputs/
+downloads/
+processed/
+*.mp4
+*.mov
+*.avi
+*.mkv
