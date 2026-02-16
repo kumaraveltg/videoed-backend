@@ -71,7 +71,9 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:5173",
+        "http://localhost:3000",
         "http://127.0.0.1:5173",
+        "http://127.0.0.1:3000",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -2677,17 +2679,33 @@ def unified_pipeline(request: UnifiedPipelineRequest):
             status_code=400,
             content={"error": str(e)}
         )
+    
+@app.on_event("startup")
+async def startup_event():
+    os.makedirs("outputs", exist_ok=True)
+    os.makedirs("videouploads", exist_ok=True)
+    print("✅ Created outputs and uploads directories")    
 
 @app.get("/video/download/{filename}")
 async def download_video(filename: str):
-    file_path = os.path.join("outputs", filename)
+    file_path = os.path.join("videouploads", filename)  # ← Look in uploads
+    
+    print(f"🔍 Looking for: {file_path}")
+    print(f"📁 File exists: {os.path.exists(file_path)}")
     
     if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="File not found")
+        # List what files are actually in uploads
+        if os.path.exists("uploads"):
+            available_files = os.listdir("uploads")
+            print(f"📁 Files in uploads: {available_files}")
+        raise HTTPException(
+            status_code=404, 
+            detail=f"File not found: {filename}"
+        )
     
     return FileResponse(
         file_path,
-        media_type="application/octet-stream",  # Forces download
+        media_type="video/mp4",
         filename=filename,
         headers={
             "Content-Disposition": f'attachment; filename="{filename}"',
@@ -2695,56 +2713,43 @@ async def download_video(filename: str):
         }
     )
 
+
+# Cleanup endpoint - deletes from uploads after download
 class CleanupRequest(BaseModel):
     filename: str
-    cleanup_uploads: bool = False
-    cleanup_outputs: bool = True
-
- 
 
 @app.post("/video/cleanup")
-async def cleanup_files(data: dict, background_tasks: BackgroundTasks):
-    """Clean up files after download"""
-    filename = data.get("filename")
-    cleanup_uploads = data.get("cleanup_uploads", False)
-    cleanup_outputs = data.get("cleanup_outputs", True)
+async def cleanup_files(request: CleanupRequest, background_tasks: BackgroundTasks):
+    """Delete file from uploads folder after download"""
     
-    deleted_files = []
+    file_path = os.path.join("videouploads", request.filename)
     
-    try:
-        # Delete output file (with delay to ensure download completes)
-        if cleanup_outputs and filename:
-            output_path = os.path.join("outputs", filename)
-            if os.path.exists(output_path):
-                background_tasks.add_task(delayed_delete, output_path, 3)
-                deleted_files.append(output_path)
-        
-        # Delete upload files if needed
-        if cleanup_uploads:
-            uploads_dir = "uploads"
-            if os.path.exists(uploads_dir):
-                for file in os.listdir(uploads_dir):
-                    file_path = os.path.join(uploads_dir, file)
-                    background_tasks.add_task(delayed_delete, file_path, 3)
-                    deleted_files.append(file_path)
+    if os.path.exists(file_path):
+        # Delete after 3 seconds to ensure download completes
+        background_tasks.add_task(delayed_delete, file_path, 3)
+        print(f"🗑️ Scheduled deletion: {file_path}")
         
         return {
             "status": "success",
-            "message": "Cleanup scheduled",
-            "files_scheduled": deleted_files
+            "message": "File deletion scheduled",
+            "file": request.filename
         }
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    else:
+        return {
+            "status": "warning",
+            "message": "File not found (may already be deleted)",
+            "file": request.filename
+        }
+
 
 async def delayed_delete(file_path: str, delay: int = 3):
-    """Delete file after a delay to ensure download completes"""
+    """Delete file after delay"""
     await asyncio.sleep(delay)
     try:
         if os.path.exists(file_path):
             os.remove(file_path)
             print(f"✅ Deleted: {file_path}")
+        else:
+            print(f"⚠️ File already deleted: {file_path}")
     except Exception as e:
         print(f"❌ Failed to delete {file_path}: {e}")
-
-    
