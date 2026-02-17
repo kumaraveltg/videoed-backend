@@ -474,7 +474,7 @@ async def upload_video(file: UploadFile):
     }
 
 @app.post("/video/trim")
-def trim_video_delete_mode(req: MultiTrimRequest,request:Request):
+def trim_video_delete_mode(req: MultiTrimRequest ):
     
     try:
         input_path = os.path.join(UPLOAD_DIR, req.filename)
@@ -577,7 +577,7 @@ def trim_video_delete_mode(req: MultiTrimRequest,request:Request):
 # YouTube download
 # -----------------------------
 @app.post("/upload/youtube")
-async def upload_youtube(request:Request,url: str = Form(...)):
+async def upload_youtube( url: str = Form(...)):
     
     try:
         # ---------- Templates ----------
@@ -675,7 +675,7 @@ async def upload_youtube(request:Request,url: str = Form(...)):
  
 
 @app.get("/video/list")
-def list_videos(request:Request):
+def list_videos( ):
     try:
         videos = []
         ALLOWED_EXTENSIONS = (".mp4", ".mp3", ".wav", ".aac", ".m4a", ".ogg", ".webm")
@@ -763,7 +763,7 @@ def normalize_to_mp4(input_path: str, output_path: str):
 
 
 @app.post("/video/merge")
-def merge_videos(req: MergeRequest,request:Request):
+def merge_videos(req: MergeRequest ):
     
     try:
         normalized_paths = []
@@ -847,8 +847,8 @@ def get_text_xy_expr(pos: str, x: Optional[int], y: Optional[int]):
 
 
 @app.post("/video/add-text")
-def add_text_overlay(request:Request):
-    req: TextOverlayRequest
+def add_text_overlay( req: TextOverlayRequest):
+    
 
     input_path = os.path.join(UPLOAD_DIR, req.filename)
 
@@ -908,7 +908,7 @@ class AudioModeRequest(BaseModel):
     mode: str                  # "mute" | "replace" | "mix"
 
 @app.post("/video/audio-control")
-def audio_control(req: AudioModeRequest,request=Request):
+def audio_control(req: AudioModeRequest ):
     """
     Process video audio based on mode:
     - mute: Remove all audio
@@ -1054,7 +1054,7 @@ class SplitScreenRequest(BaseModel):
     audio_filename: str | None = None
 
 @app.post("/video/split-screen")
-def split_screen(req: SplitScreenRequest,request=Request):
+def split_screen(req: SplitScreenRequest ):
 
     top_path = os.path.join(UPLOAD_DIR, req.top_video)
     bottom_path = os.path.join(UPLOAD_DIR, req.bottom_video)
@@ -1210,7 +1210,7 @@ def build_fade_filter(insert_label: str, fade_in: float, fade_out: float,
 # =====================================================
 
 @app.post("/video/add-multiple-inserts")
-def add_multiple_video_inserts(req: MultipleVideoInsertRequest,request:Request):
+def add_multiple_video_inserts(req: MultipleVideoInsertRequest ):
     """
     Add multiple video inserts (Picture-in-Picture) to main video
     
@@ -1556,7 +1556,7 @@ class VideoInsertAtPositionRequest(BaseModel):
     output_name: Optional[str] = None
 
 @app.post("/video/insert-at-position")
-def insert_video_at_position(req: VideoInsertAtPositionRequest,request:Request):
+def insert_video_at_position(req: VideoInsertAtPositionRequest ):
     """
     Fast video insert using single-pass filter_complex.
     """
@@ -1819,7 +1819,7 @@ class AddImageOverlaysRequest(BaseModel):
 # =====================================================
 
 @app.post("/video/add-image-overlays")
-def add_image_overlays(req: AddImageOverlaysRequest,request:Request):
+def add_image_overlays(req: AddImageOverlaysRequest ):
     """
     Add multiple image overlays to video.
     
@@ -2523,7 +2523,7 @@ class UnifiedPipelineEngine:
         
         return ["-map", "0:a"]
     
-    def execute_pipeline(self, request: UnifiedPipelineRequest,request1:Request) -> dict:
+    def execute_pipeline(self, request: UnifiedPipelineRequest ) -> dict:
         """Execute the complete unified pipeline"""
         
         try:
