@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, Form,HTTPException,BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, Form,HTTPException,BackgroundTasks,Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse,FileResponse,StreamingResponse
 from fastapi.staticfiles import StaticFiles 
@@ -32,13 +32,13 @@ if SYSTEM == "Windows":
     FFPROBE_PATH = r"E:\ffmpeg\bin\ffprobe.exe"
     UPLOAD_DIR   = r"E:\videoed-backend\videouploads"
     UPLOAD_DIREC = r"E:\videoed-backend\videouploads"
-    ffmpeg_location = r"E:\ffmpeg\bin"
+    ffmpeg_location = r"E:\ffmpeg\bin" 
 else:
     FFMPEG_PATH  = "ffmpeg"
     FFPROBE_PATH = "ffprobe"
     UPLOAD_DIR   = "/var/www/videoed-backend/videouploads"
     UPLOAD_DIREC = "/var/www/videoed-backend/videouploads"
-    ffmpeg_location = "/usr/bin/ffmpeg"
+    ffmpeg_location = "/usr/bin/" 
 
 # ✅ Create upload dir if it doesn't exist
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -253,7 +253,8 @@ async def get_video_frame(filename: str, frame_index: int):
 # Local file upload
 # -----------------------------
 @app.post("/upload/local")
-async def upload_local(file: UploadFile = File(...)):
+async def upload_local(request:Request,file: UploadFile = File(...) ):
+    
     """
     Smart upload endpoint that handles videos, images, and audio.
     Preserves original file extensions and processes based on file type.
@@ -324,7 +325,7 @@ async def upload_local(file: UploadFile = File(...)):
             "filename": filename,
             "file_path": file_path,
             "file_type": file_type,
-            "video_url": f"http://localhost:8000/videos/{filename}",  # Works for all types
+            "video_url": f"{request.url.scheme}://{request.headers['host']}/videos/{filename}",  # Works for all types
             "file_size_mb": round(os.path.getsize(file_path) / (1024 * 1024), 2)
         }
         
@@ -390,7 +391,7 @@ async def upload_local(file: UploadFile = File(...)):
             
             # Collect thumbnails
             thumbnails = [
-                f"http://localhost:8000/videos/{filename}_thumbs/{os.path.basename(f)}"
+                f"{request.url.scheme}://{request.headers['host']}/videos/{filename}_thumbs/{os.path.basename(f)}"
                 for f in sorted(glob.glob(os.path.join(thumb_dir, "thumb_*.jpg")))
             ]
             
@@ -401,7 +402,7 @@ async def upload_local(file: UploadFile = File(...)):
                 "thumbnails": thumbnails,
                 "thumbnail_count": len(thumbnails),
                 "audio_filename": audio_filename if audio_exists else None,
-                "audio_url": f"http://localhost:8000/videos/{audio_filename}" if audio_exists else None
+                "audio_url": f"{request.url.scheme}://{request.headers['host']}/videos/{audio_filename}" if audio_exists else None
             })
         
         # =====================================================
@@ -470,7 +471,8 @@ async def upload_video(file: UploadFile):
     }
 
 @app.post("/video/trim")
-def trim_video_delete_mode(req: MultiTrimRequest):
+def trim_video_delete_mode(req: MultiTrimRequest,request:Request):
+    
     try:
         input_path = os.path.join(UPLOAD_DIR, req.filename)
 
@@ -559,7 +561,7 @@ def trim_video_delete_mode(req: MultiTrimRequest):
             "deleted_ranges": delete_ranges,
             "kept_ranges": keep_ranges,
             "output": output_name,
-            "video_url": f"http://localhost:8000/videos/{output_name}"
+            "video_url": f"{request.url.scheme}://{request.headers['host']}/videos/{output_name}"
         }
 
     except Exception as e:
@@ -572,7 +574,8 @@ def trim_video_delete_mode(req: MultiTrimRequest):
 # YouTube download
 # -----------------------------
 @app.post("/upload/youtube")
-async def upload_youtube(url: str = Form(...)):
+async def upload_youtube(request:Request,url: str = Form(...)):
+    
     try:
         # ---------- Templates ----------
         video_template = os.path.join(UPLOAD_DIR, "%(title).200s_video.%(ext)s")
@@ -656,9 +659,9 @@ async def upload_youtube(url: str = Form(...)):
             "message": "YouTube video + audio downloaded successfully",
             "title": info.get("title"),
             "filename": safe_video,
-            "video_url": f"http://localhost:8000/videos/{safe_video}",
+            "video_url": f"{request.url.scheme}://{request.headers['host']}/videos/{safe_video}",
             "audio_filename": safe_audio_name,
-            "audio_url": f"http://localhost:8000/videos/{safe_audio_name}" if safe_audio_name else None,
+            "audio_url": f"{request.url.scheme}://{request.headers['host']}/videos/{safe_audio_name}" if safe_audio_name else None,
             "file_size_mb": round(os.path.getsize(safe_video_path) / (1024 * 1024), 2)
         }
 
@@ -669,7 +672,7 @@ async def upload_youtube(url: str = Form(...)):
  
 
 @app.get("/video/list")
-def list_videos():
+def list_videos(request:Request):
     try:
         videos = []
         ALLOWED_EXTENSIONS = (".mp4", ".mp3", ".wav", ".aac", ".m4a", ".ogg", ".webm")
@@ -677,7 +680,7 @@ def list_videos():
             if f.lower().endswith(ALLOWED_EXTENSIONS):
                 videos.append({
                     "filename": f,
-                    "video_url": f"http://localhost:8000/videos/{f}",
+                    "video_url": f"{request.url.scheme}://{request.headers['host']}/videos/{f}",
                     "file_size_mb": round(
                         os.path.getsize(os.path.join(UPLOAD_DIR, f)) / (1024 * 1024), 2
                     )
@@ -757,7 +760,8 @@ def normalize_to_mp4(input_path: str, output_path: str):
 
 
 @app.post("/video/merge")
-def merge_videos(req: MergeRequest):
+def merge_videos(req: MergeRequest,request:Request):
+    
     try:
         normalized_paths = []
 
@@ -814,7 +818,7 @@ def merge_videos(req: MergeRequest):
         return {
             "message": "Videos merged successfully",
             "output": req.output_name,
-            "video_url": f"http://localhost:8000/videos/{req.output_name}"
+            "video_url": f"{request.url.scheme}://{request.headers['host']}/videos/{req.output_name}"
         }
 
     except Exception as e:
@@ -840,7 +844,8 @@ def get_text_xy_expr(pos: str, x: Optional[int], y: Optional[int]):
 
 
 @app.post("/video/add-text")
-def add_text_overlay(req: TextOverlayRequest):
+def add_text_overlay(request:Request):
+    req: TextOverlayRequest
 
     input_path = os.path.join(UPLOAD_DIR, req.filename)
 
@@ -891,7 +896,7 @@ def add_text_overlay(req: TextOverlayRequest):
     return {
         "message": "Text overlay added",
         "output": output_name,
-        "video_url": f"http://localhost:8000/videos/{output_name}"
+        "video_url": f"{request.url.scheme}://{request.headers['host']}/videos/{output_name}"
     }
 
 class AudioModeRequest(BaseModel):
@@ -900,7 +905,7 @@ class AudioModeRequest(BaseModel):
     mode: str                  # "mute" | "replace" | "mix"
 
 @app.post("/video/audio-control")
-def audio_control(req: AudioModeRequest):
+def audio_control(req: AudioModeRequest,request=Request):
     """
     Process video audio based on mode:
     - mute: Remove all audio
@@ -1029,7 +1034,7 @@ def audio_control(req: AudioModeRequest):
     return {
         "message": f"Audio {mode} successful",
         "output": output_name,
-        "video_url": f"http://localhost:8000/videos/{output_name}"
+        "video_url": f"{request.url.scheme}://{request.headers['host']}/videos/{output_name}"
     }
 
 @app.post("/upload/audio")
@@ -1046,7 +1051,7 @@ class SplitScreenRequest(BaseModel):
     audio_filename: str | None = None
 
 @app.post("/video/split-screen")
-def split_screen(req: SplitScreenRequest):
+def split_screen(req: SplitScreenRequest,request=Request):
 
     top_path = os.path.join(UPLOAD_DIR, req.top_video)
     bottom_path = os.path.join(UPLOAD_DIR, req.bottom_video)
@@ -1114,7 +1119,7 @@ def split_screen(req: SplitScreenRequest):
     return {
         "message": "Split screen video created",
         "output": output_name,
-        "video_url": f"http://localhost:8000/videos/{output_name}"
+        "video_url": f"{request.url.scheme}://{request.headers['host']}/videos/{output_name}"
     }
 
 
@@ -1202,7 +1207,7 @@ def build_fade_filter(insert_label: str, fade_in: float, fade_out: float,
 # =====================================================
 
 @app.post("/video/add-multiple-inserts")
-def add_multiple_video_inserts(req: MultipleVideoInsertRequest):
+def add_multiple_video_inserts(req: MultipleVideoInsertRequest,request:Request):
     """
     Add multiple video inserts (Picture-in-Picture) to main video
     
@@ -1503,7 +1508,7 @@ def add_multiple_video_inserts(req: MultipleVideoInsertRequest):
         return {
             "message": "Multiple video inserts added successfully",
             "output": output_name,
-            "video_url": f"http://localhost:8000/videos/{output_name}",
+            "video_url": f"{request.url.scheme}://{request.headers['host']}/videos/{output_name}",
             "inserts_count": len(processed_inserts),
             "main_video_duration": main_duration,
             "inserts_summary": [
@@ -1548,7 +1553,7 @@ class VideoInsertAtPositionRequest(BaseModel):
     output_name: Optional[str] = None
 
 @app.post("/video/insert-at-position")
-def insert_video_at_position(req: VideoInsertAtPositionRequest):
+def insert_video_at_position(req: VideoInsertAtPositionRequest,request:Request):
     """
     Fast video insert using single-pass filter_complex.
     """
@@ -1754,7 +1759,7 @@ def insert_video_at_position(req: VideoInsertAtPositionRequest):
         return {
             "message": "Video insert successful",
             "output": output_name,
-            "video_url": f"http://localhost:8000/videos/{output_name}",
+            "video_url": f"{request.url.scheme}://{request.headers['host']}/videos/{output_name}",
             "original_duration": main_duration,
             "final_duration": final_duration,
             "resolution": f"{final_info['width']}x{final_info['height']}",
@@ -1811,7 +1816,7 @@ class AddImageOverlaysRequest(BaseModel):
 # =====================================================
 
 @app.post("/video/add-image-overlays")
-def add_image_overlays(req: AddImageOverlaysRequest):
+def add_image_overlays(req: AddImageOverlaysRequest,request:Request):
     """
     Add multiple image overlays to video.
     
@@ -2033,7 +2038,7 @@ def add_image_overlays(req: AddImageOverlaysRequest):
         return {
             "message": "Image overlays added successfully",
             "output": output_name,
-            "video_url": f"http://localhost:8000/videos/{output_name}",
+            "video_url": f"{request.url.scheme}://{request.headers['host']}/videos/{output_name}",
             "overlays_count": len(validated_overlays),
             "video_duration": video_duration,
             "overlays_summary": [
@@ -2515,7 +2520,7 @@ class UnifiedPipelineEngine:
         
         return ["-map", "0:a"]
     
-    def execute_pipeline(self, request: UnifiedPipelineRequest) -> dict:
+    def execute_pipeline(self, request: UnifiedPipelineRequest,request1:Request) -> dict:
         """Execute the complete unified pipeline"""
         
         try:
@@ -2653,7 +2658,7 @@ class UnifiedPipelineEngine:
             return {
                 "message": "Unified pipeline completed successfully",
                 "output": output_name,
-                "video_url": f"http://localhost:8000/videos/{output_name}",
+                "video_url": f"{request1.url.scheme}://{request1.headers['host']}/videos/{output_name}",
                 "tasks_applied": enabled_tasks,
                 "output_info": {
                     "duration": output_info['duration'],
@@ -2672,7 +2677,7 @@ class UnifiedPipelineEngine:
 # =====================================================
 
 @app.post("/video/unified-pipeline")
-def unified_pipeline(request: UnifiedPipelineRequest):
+def unified_pipeline(request: UnifiedPipelineRequest ):
     """
     🎬 UNIFIED VIDEO PROCESSING PIPELINE
     
