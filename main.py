@@ -33,12 +33,14 @@ if SYSTEM == "Windows":
     UPLOAD_DIR   = r"E:\videoed-backend\videouploads"
     UPLOAD_DIREC = r"E:\videoed-backend\videouploads"
     ffmpeg_location = r"E:\ffmpeg\bin" 
+    video_url = "http://localhost:8000"
 else:
     FFMPEG_PATH  = "ffmpeg"
     FFPROBE_PATH = "ffprobe"
     UPLOAD_DIR   = "/var/www/videoed-backend/videouploads"
     UPLOAD_DIREC = "/var/www/videoed-backend/videouploads"
     ffmpeg_location = "/usr/bin/" 
+    video_url = "http://159.89.167.156:2378"
 
 # ✅ Create upload dir if it doesn't exist
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -47,6 +49,7 @@ print(f"🖥️  System   : {SYSTEM}")
 print(f"🎬 FFmpeg   : {FFMPEG_PATH}")
 print(f"🔍 FFprobe  : {FFPROBE_PATH}")
 print(f"📁 Upload   : {UPLOAD_DIR}")
+
 
 app = FastAPI()
 
@@ -325,7 +328,7 @@ async def upload_local(request:Request,file: UploadFile = File(...) ):
             "filename": filename,
             "file_path": file_path,
             "file_type": file_type,
-            "video_url": f"{request.url.scheme}://{request.headers['host']}/videos/{filename}",  # Works for all types
+            "video_url": f"{video_url}/videos/{filename}",  # Works for all types
             "file_size_mb": round(os.path.getsize(file_path) / (1024 * 1024), 2)
         }
         
@@ -391,7 +394,7 @@ async def upload_local(request:Request,file: UploadFile = File(...) ):
             
             # Collect thumbnails
             thumbnails = [
-                f"{request.url.scheme}://{request.headers['host']}/videos/{filename}_thumbs/{os.path.basename(f)}"
+                f"{video_url}/videos/{filename}_thumbs/{os.path.basename(f)}"
                 for f in sorted(glob.glob(os.path.join(thumb_dir, "thumb_*.jpg")))
             ]
             
@@ -402,7 +405,7 @@ async def upload_local(request:Request,file: UploadFile = File(...) ):
                 "thumbnails": thumbnails,
                 "thumbnail_count": len(thumbnails),
                 "audio_filename": audio_filename if audio_exists else None,
-                "audio_url": f"{request.url.scheme}://{request.headers['host']}/videos/{audio_filename}" if audio_exists else None
+                "audio_url": f"{video_url}/videos/{audio_filename}" if audio_exists else None
             })
         
         # =====================================================
@@ -561,7 +564,7 @@ def trim_video_delete_mode(req: MultiTrimRequest,request:Request):
             "deleted_ranges": delete_ranges,
             "kept_ranges": keep_ranges,
             "output": output_name,
-            "video_url": f"{request.url.scheme}://{request.headers['host']}/videos/{output_name}"
+            "video_url": f"{video_url}/videos/{output_name}"
         }
 
     except Exception as e:
@@ -659,9 +662,9 @@ async def upload_youtube(request:Request,url: str = Form(...)):
             "message": "YouTube video + audio downloaded successfully",
             "title": info.get("title"),
             "filename": safe_video,
-            "video_url": f"{request.url.scheme}://{request.headers['host']}/videos/{safe_video}",
+            "video_url": f"{video_url}/videos/{safe_video}",
             "audio_filename": safe_audio_name,
-            "audio_url": f"{request.url.scheme}://{request.headers['host']}/videos/{safe_audio_name}" if safe_audio_name else None,
+            "audio_url": f"{video_url}/videos/{safe_audio_name}" if safe_audio_name else None,
             "file_size_mb": round(os.path.getsize(safe_video_path) / (1024 * 1024), 2)
         }
 
@@ -680,7 +683,7 @@ def list_videos(request:Request):
             if f.lower().endswith(ALLOWED_EXTENSIONS):
                 videos.append({
                     "filename": f,
-                    "video_url": f"{request.url.scheme}://{request.headers['host']}/videos/{f}",
+                    "video_url": f"{video_url}/videos/{f}",
                     "file_size_mb": round(
                         os.path.getsize(os.path.join(UPLOAD_DIR, f)) / (1024 * 1024), 2
                     )
@@ -818,7 +821,7 @@ def merge_videos(req: MergeRequest,request:Request):
         return {
             "message": "Videos merged successfully",
             "output": req.output_name,
-            "video_url": f"{request.url.scheme}://{request.headers['host']}/videos/{req.output_name}"
+            "video_url": f"{video_url}/videos/{req.output_name}"
         }
 
     except Exception as e:
@@ -896,7 +899,7 @@ def add_text_overlay(request:Request):
     return {
         "message": "Text overlay added",
         "output": output_name,
-        "video_url": f"{request.url.scheme}://{request.headers['host']}/videos/{output_name}"
+        "video_url": f"{video_url}/videos/{output_name}"
     }
 
 class AudioModeRequest(BaseModel):
@@ -1034,7 +1037,7 @@ def audio_control(req: AudioModeRequest,request=Request):
     return {
         "message": f"Audio {mode} successful",
         "output": output_name,
-        "video_url": f"{request.url.scheme}://{request.headers['host']}/videos/{output_name}"
+        "video_url": f"{video_url}/videos/{output_name}"
     }
 
 @app.post("/upload/audio")
@@ -1119,7 +1122,7 @@ def split_screen(req: SplitScreenRequest,request=Request):
     return {
         "message": "Split screen video created",
         "output": output_name,
-        "video_url": f"{request.url.scheme}://{request.headers['host']}/videos/{output_name}"
+        "video_url": f"{video_url}/videos/{output_name}"
     }
 
 
@@ -1508,7 +1511,7 @@ def add_multiple_video_inserts(req: MultipleVideoInsertRequest,request:Request):
         return {
             "message": "Multiple video inserts added successfully",
             "output": output_name,
-            "video_url": f"{request.url.scheme}://{request.headers['host']}/videos/{output_name}",
+            "video_url": f"{video_url}/videos/{output_name}",
             "inserts_count": len(processed_inserts),
             "main_video_duration": main_duration,
             "inserts_summary": [
@@ -1759,7 +1762,7 @@ def insert_video_at_position(req: VideoInsertAtPositionRequest,request:Request):
         return {
             "message": "Video insert successful",
             "output": output_name,
-            "video_url": f"{request.url.scheme}://{request.headers['host']}/videos/{output_name}",
+            "video_url": f"{video_url}/videos/{output_name}",
             "original_duration": main_duration,
             "final_duration": final_duration,
             "resolution": f"{final_info['width']}x{final_info['height']}",
@@ -2038,7 +2041,7 @@ def add_image_overlays(req: AddImageOverlaysRequest,request:Request):
         return {
             "message": "Image overlays added successfully",
             "output": output_name,
-            "video_url": f"{request.url.scheme}://{request.headers['host']}/videos/{output_name}",
+            "video_url": f"{video_url}/videos/{output_name}",
             "overlays_count": len(validated_overlays),
             "video_duration": video_duration,
             "overlays_summary": [
@@ -2658,7 +2661,7 @@ class UnifiedPipelineEngine:
             return {
                 "message": "Unified pipeline completed successfully",
                 "output": output_name,
-                "video_url": f"{request1.url.scheme}://{request1.headers['host']}/videos/{output_name}",
+                "video_url": f"{video_url}/videos/{output_name}",
                 "tasks_applied": enabled_tasks,
                 "output_info": {
                     "duration": output_info['duration'],
