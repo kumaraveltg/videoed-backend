@@ -20,7 +20,33 @@ from pathlib import Path
 import cv2
 import io
 from PIL import Image
+import platform
 
+# ============================================
+# ✅ OS DETECTION - Works on Windows & Ubuntu
+# ============================================
+SYSTEM = platform.system()  # "Windows" or "Linux"
+
+if SYSTEM == "Windows":
+    FFMPEG_PATH  = r"E:\ffmpeg\bin\ffmpeg.exe"
+    FFPROBE_PATH = r"E:\ffmpeg\bin\ffprobe.exe"
+    UPLOAD_DIR   = r"E:\videoed-backend\videouploads"
+    UPLOAD_DIREC = r"E:\videoed-backend\videouploads"
+    ffmpeg_location = r"E:\ffmpeg\bin"
+else:
+    FFMPEG_PATH  = "ffmpeg"
+    FFPROBE_PATH = "ffprobe"
+    UPLOAD_DIR   = "/var/www/videoed-backend/videouploads"
+    UPLOAD_DIREC = "/var/www/videoed-backend/videouploads"
+    ffmpeg_location = "/usr/bin/ffmpeg"
+
+# ✅ Create upload dir if it doesn't exist
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+print(f"🖥️  System   : {SYSTEM}")
+print(f"🎬 FFmpeg   : {FFMPEG_PATH}")
+print(f"🔍 FFprobe  : {FFPROBE_PATH}")
+print(f"📁 Upload   : {UPLOAD_DIR}")
 
 app = FastAPI()
 
@@ -86,8 +112,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_DIR = os.path.join(BASE_DIR, "videouploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-UPLOAD_DIREC = r"E:\videoed-backend\videouploads"
-FFMPEG_PATH = r"E:\ffmpeg\bin\ffmpeg.exe"
+# UPLOAD_DIREC = r"E:\videoed-backend\videouploads"
+# FFMPEG_PATH = r"E:\ffmpeg\bin\ffmpeg.exe"
 
 # ---- Serve uploaded videos ----
 app.mount("/videos", StaticFiles(directory=UPLOAD_DIR), name="videos")
@@ -117,7 +143,7 @@ def safe_filename(name: str) -> str:
 
 def get_video_duration(file_path: str) -> float:
     cmd = [
-        r"E:\ffmpeg\bin\ffprobe.exe",
+        FFPROBE_PATH,
         "-v", "error",
         "-show_entries", "format=duration",
         "-of", "default=noprint_wrappers=1:nokey=1",
@@ -473,7 +499,7 @@ def trim_video_delete_mode(req: MultiTrimRequest):
             temp_path = os.path.join(UPLOAD_DIR, temp_name)
 
             ffmpeg_cmd = [
-                r"E:\ffmpeg\bin\ffmpeg.exe",
+               FFMPEG_PATH,
                 "-y",
 
                 "-ss", str(cut["start"]),
@@ -510,7 +536,7 @@ def trim_video_delete_mode(req: MultiTrimRequest):
         output_path = os.path.join(UPLOAD_DIR, output_name)
 
         concat_cmd = [
-            r"E:\ffmpeg\bin\ffmpeg.exe",
+            FFMPEG_PATH,
             "-y",
             "-f", "concat",
             "-safe", "0",
@@ -557,7 +583,7 @@ async def upload_youtube(url: str = Form(...)):
             "outtmpl": video_template,
             "format": "bv*+ba/b",
             "merge_output_format": "mp4",
-            "ffmpeg_location": r"E:\ffmpeg\bin",
+            "ffmpeg_location": ffmpeg_location,
             "noplaylist": True,
             "force_ipv4": True,
             "retries": 5,
@@ -572,7 +598,7 @@ async def upload_youtube(url: str = Form(...)):
         audio_opts = {
             "outtmpl": audio_template,
             "format": "ba",
-            "ffmpeg_location": r"E:\ffmpeg\bin",
+            "ffmpeg_location": ffmpeg_location,
             "noplaylist": True,
             "force_ipv4": True,
             "quiet": True,
@@ -699,7 +725,7 @@ def stream_video(filename: str):
 
 def normalize_to_mp4(input_path: str, output_path: str):
     cmd = [
-        r"E:\ffmpeg\bin\ffmpeg.exe",
+        FFMPEG_PATH,
         "-y",
         "-i", input_path,
 
@@ -761,7 +787,7 @@ def merge_videos(req: MergeRequest):
         output_path = os.path.join(UPLOAD_DIR, req.output_name)
 
         ffmpeg_cmd = [
-                r"E:\ffmpeg\bin\ffmpeg.exe",
+                FFMPEG_PATH,
                 "-y",
                 "-f", "concat",
                 "-safe", "0",
@@ -849,7 +875,7 @@ def add_text_overlay(req: TextOverlayRequest):
     filter_complex = ",".join(draw_filters)
 
     ffmpeg_cmd = [
-        r"E:\ffmpeg\bin\ffmpeg.exe",
+        FFMPEG_PATH,
         "-y",
         "-i", input_path,
         "-vf", filter_complex,
@@ -883,8 +909,8 @@ def audio_control(req: AudioModeRequest):
     - mix: Mix video audio with uploaded audio
     """
 
-    UPLOAD_DIREC = r"E:\videoed-backend\videouploads"
-    FFMPEG_PATH = r"E:\ffmpeg\bin\ffmpeg.exe"
+    # UPLOAD_DIREC = r"E:\videoed-backend\videouploads"
+    # FFMPEG_PATH = r"E:\ffmpeg\bin\ffmpeg.exe"
 
     input_video = os.path.join(UPLOAD_DIREC, req.filename)
 
@@ -1130,7 +1156,7 @@ class MultipleVideoInsertRequest(BaseModel):
 def get_video_info(video_path: str) -> dict:
     """Get video metadata using ffprobe"""
     probe_cmd = [
-        r"E:\ffmpeg\bin\ffprobe.exe",
+        FFPROBE_PATH,
         "-v", "error",
         "-select_streams", "v:0",
         "-show_entries", "stream=width,height,duration,avg_frame_rate",
@@ -2655,7 +2681,7 @@ def unified_pipeline(request: UnifiedPipelineRequest):
     """
     
    #engine = UnifiedPipelineEngine(UPLOAD_DIREC, FFMPEG_PATH)
-    engine = UnifiedPipelineEngine( r"E:\videoed-backend\videouploads", r"E:\ffmpeg\bin\ffmpeg.exe")
+    engine = UnifiedPipelineEngine(UPLOAD_DIR, FFMPEG_PATH)
     
     try:
         result = engine.execute_pipeline(request)
