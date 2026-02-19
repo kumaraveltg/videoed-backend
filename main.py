@@ -730,6 +730,7 @@ def stream_video(filename: str):
     return StreamingResponse(iterfile(), headers=headers)
 
 
+
 def normalize_to_mp4(input_path: str, output_path: str):
     cmd = [
     FFMPEG_PATH,
