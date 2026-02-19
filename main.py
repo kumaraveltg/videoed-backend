@@ -102,7 +102,9 @@ app.add_middleware(
         "http://localhost:5173",
         "http://localhost:3000",
         "http://127.0.0.1:5173",
-        "http://127.0.0.1:3000",
+        "http://127.0.0.1:3000", 
+        "http://159.89.167.156",
+        "http://159.89.167.156:2378",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -256,7 +258,7 @@ async def get_video_frame(filename: str, frame_index: int):
 # Local file upload
 # -----------------------------
 @app.post("/upload/local")
-async def upload_local(request:Request,file: UploadFile = File(...) ):
+async def upload_local( file: UploadFile = File(...) ):
     
     """
     Smart upload endpoint that handles videos, images, and audio.
@@ -354,9 +356,9 @@ async def upload_local(request:Request,file: UploadFile = File(...) ):
                         FFMPEG_PATH,
                         "-y",
                         "-i", file_path,
-                        "-vf", "fps=1,scale=160:-1",
+                        "-vf", "fps=1/5,scale=160:-1",
                         "-q:v", "5",
-                        "-threads", "2",
+                        "-threads", "0",
                         thumb_pattern
                     ],
                     True, True
@@ -373,6 +375,7 @@ async def upload_local(request:Request,file: UploadFile = File(...) ):
                         "-i", file_path,
                         "-vn",
                         "-acodec", "copy",
+                        "-threads","0",
                         audio_path
                     ],
                     True, True
@@ -435,7 +438,7 @@ async def upload_local(request:Request,file: UploadFile = File(...) ):
             try:
                 # Get audio duration using ffprobe
                 probe_cmd = [
-                    FFMPEG_PATH.replace("ffmpeg.exe", "ffprobe.exe"),
+                    FFPROBE_PATH,  #.replace("ffmpeg.exe", "ffprobe.exe"),
                     "-v", "error",
                     "-show_entries", "format=duration",
                     "-of", "default=noprint_wrappers=1:nokey=1",
@@ -570,9 +573,7 @@ def trim_video_delete_mode(req: MultiTrimRequest ):
     except Exception as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
 
-
-
-
+ 
 # -----------------------------
 # YouTube download
 # -----------------------------
@@ -731,44 +732,45 @@ def stream_video(filename: str):
 
 def normalize_to_mp4(input_path: str, output_path: str):
     cmd = [
-        FFMPEG_PATH,
-        "-y",
-        "-i", input_path,
-
-        # Video normalize
-        "-vf", "scale=1280:720:force_original_aspect_ratio=decrease,"
-               "pad=1280:720:(ow-iw)/2:(oh-ih)/2",
-        "-r", "30",
-
-        # Codecs
-        #"-c:v", "libx264",
-        "-c", "copy",
-        "-pix_fmt", "yuv420p",
-        "-profile:v", "high",
-        "-level", "4.1",
-
-        # Audio normalize (even if missing)
-        "-c:a", "aac",
-        "-b:a", "192k",
-
-        # Important for audio-only inputs
-        "-shortest",
-
-        output_path
-    ]
+    FFMPEG_PATH,
+    "-y",
+    "-i", input_path,
+    "-vf", "scale=1280:720:force_original_aspect_ratio=decrease,"
+           "pad=1280:720:(ow-iw)/2:(oh-ih)/2",
+    "-r", "30",
+    "-c:v", "libx264",
+    "-preset", "ultrafast",  # ✅ fastest encoding
+    "-crf", "28",
+    "-pix_fmt", "yuv420p",
+    "-profile:v", "high",
+    "-level", "4.1",
+    "-c:a", "aac",
+    "-b:a", "192k",
+    "-ar", "44100",
+    "-ac", "2",
+    "-threads", "0",         # ✅ use all CPU cores
+    "-shortest",
+    output_path
+]
 
     result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
+    print("NORMALIZE STDERR:", result.stderr)
+    print("NORMALIZE RETURN CODE:", result.returncode)
+
+    if result.returncode != 0:                          # ✅ moved before return
         raise Exception(f"FFmpeg normalize failed:\n{result.stderr}")
+
+    return result
 
 
 @app.post("/video/merge")
-def merge_videos(req: MergeRequest ):
-    
-    try:
-        normalized_paths = []
+def merge_videos(req: MergeRequest):
+    normalized_paths = []
+    list_file = None 
+     
 
-        # 1️⃣ Normalize all inputs
+    try:
+        # 1️⃣ Normalize all inputs to identical codec/resolution/fps/audio
         for name in req.files:
             input_path = os.path.join(UPLOAD_DIR, name)
 
@@ -781,42 +783,46 @@ def merge_videos(req: MergeRequest ):
             norm_name = f"norm_{uuid.uuid4().hex}.mp4"
             norm_path = os.path.join(UPLOAD_DIR, norm_name)
 
-            normalize_to_mp4(input_path, norm_path)
+            result = normalize_to_mp4(input_path, norm_path)
+
+            if not os.path.exists(norm_path):
+                raise Exception(f"Normalization failed for {name}")
+
             normalized_paths.append(norm_path)
 
         # 2️⃣ Create concat list
-        list_file = os.path.join(UPLOAD_DIR, "merge_list.txt")
+        list_file = os.path.join(UPLOAD_DIR, f"merge_list_{uuid.uuid4().hex}.txt")
         with open(list_file, "w", encoding="utf-8") as f:
             for path in normalized_paths:
-                f.write(f"file '{path.replace('\\', '/')}'\n")
+                safe_path = path.replace("\\", "/")
+                f.write(f"file '{safe_path}'\n")
 
-        # 3️⃣ Merge normalized files
+        # 3️⃣ Merge — re-encode so pix_fmt/audio settings actually apply
         output_path = os.path.join(UPLOAD_DIR, req.output_name)
 
         ffmpeg_cmd = [
-                FFMPEG_PATH,
-                "-y",
-                "-f", "concat",
-                "-safe", "0",
-                "-i", list_file,
+            FFMPEG_PATH,
+            "-y",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", list_file,
+            "-c:v", "libx264",      # re-encode video
+            "-pix_fmt", "yuv420p",  # broad compatibility
+            "-preset", "ultrafast",
+            "-crf", "23",
+            "-c:a", "aac",          # re-encode audio
+            "-b:a", "192k",
+            "-movflags", "+faststart",
+            output_path
+        ]
 
-                # Force real concatenation
-                "-c", "copy",
-                #"-c:v", "libx264",
-                "-pix_fmt", "yuv420p",
-                #"-c:a", "aac",
-                "-b:a", "192k",
-
-                output_path
-            ]
-
-        result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
+        subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
 
         if result.returncode != 0:
             raise Exception(f"FFmpeg merge failed:\n{result.stderr}")
 
         if not os.path.exists(output_path):
-            raise Exception("Merge failed: output not created")
+            raise Exception("Merge failed: output file not created")
 
         return {
             "message": "Videos merged successfully",
@@ -829,6 +835,20 @@ def merge_videos(req: MergeRequest ):
             status_code=400,
             content={"error": str(e)}
         )
+
+    finally:
+        # 4️⃣ Always clean up temp normalized files and list
+        for path in normalized_paths:
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except Exception:
+                pass
+        if list_file and os.path.exists(list_file):
+            try:
+                os.remove(list_file)
+            except Exception:
+                pass
 
 
 def get_text_xy_expr(pos: str, x: Optional[int], y: Optional[int]):
@@ -2198,9 +2218,10 @@ class UnifiedPipelineEngine:
     SUPPORTED_IMAGE_FORMATS = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp'}
     SUPPORTED_AUDIO_FORMATS = {'.mp3', '.wav', '.aac', '.m4a', '.ogg', '.flac'}
 
-    def __init__(self, upload_dir: str, ffmpeg_path: str):
+    def __init__(self, upload_dir: str, ffmpeg_path: str,ffprobe_path: str):
         self.upload_dir = upload_dir
         self.ffmpeg_path = ffmpeg_path
+        self.ffprobe_path= FFPROBE_PATH
         self.temp_files = [] 
     
     def cleanup(self):
@@ -2253,7 +2274,7 @@ class UnifiedPipelineEngine:
     def get_video_duration(self, file_path: str) -> float:
         """Get video duration"""
         cmd = [
-            self.ffmpeg_path.replace("ffmpeg.exe", "ffprobe.exe"),
+            self.ffprobe_path  ,#.replace("ffmpeg.exe", "ffprobe.exe"),
             "-v", "error",
             "-show_entries", "format=duration",
             "-of", "default=noprint_wrappers=1:nokey=1",
@@ -2267,7 +2288,7 @@ class UnifiedPipelineEngine:
     def get_video_info(self, video_path: str) -> dict:
         """Get comprehensive video metadata"""
         probe_cmd = [
-            self.ffmpeg_path.replace("ffmpeg.exe", "ffprobe.exe"),
+            self.ffprobe_path, #.replace("ffmpeg.exe", "ffprobe.exe"),
             "-v", "error",
             "-select_streams", "v:0",
             "-show_entries", "stream=width,height,duration",
@@ -2635,6 +2656,7 @@ class UnifiedPipelineEngine:
                 "-c:v", "libx264",
                 "-preset", request.output_quality,
                 "-crf", str(request.output_crf),
+                "-threads","0",
                 "-pix_fmt", "yuv420p",
                 "-movflags", "+faststart"
             ])
@@ -2689,7 +2711,7 @@ def unified_pipeline(request: UnifiedPipelineRequest ):
     """
     
    #engine = UnifiedPipelineEngine(UPLOAD_DIREC, FFMPEG_PATH)
-    engine = UnifiedPipelineEngine(UPLOAD_DIR, FFMPEG_PATH)
+    engine = UnifiedPipelineEngine(UPLOAD_DIR, FFMPEG_PATH,FFPROBE_PATH)
     
     try:
         result = engine.execute_pipeline(request)
