@@ -2161,11 +2161,21 @@ class ImageOverlaysTask(BaseModel):
     enabled: bool = False
     overlays: List[ImageOverlayConfig] = []
 
+class AudioClipConfig(BaseModel):
+    audio_filename: str
+    clip_start: float = 0.0
+    clip_end: Optional[float] = None
+
 class AudioControlTask(BaseModel):
     """Audio control task"""
     enabled: bool = False
     mode: Literal["keep", "mute", "replace", "mix"] = "keep"
     audio_filename: Optional[str] = None
+    clip_start: Optional[float] = None
+    clip_end: Optional[float] = None
+    audio_clips: Optional[List[AudioClipConfig]] = []
+    volume: float = 1.0
+    original_volume: float = 0.7
 
 class SplitScreenTask(BaseModel):
     """Split-screen task"""
@@ -2217,7 +2227,7 @@ class UnifiedPipelineEngine:
     # Supported file formats
     SUPPORTED_VIDEO_FORMATS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.flv', '.wmv'}
     SUPPORTED_IMAGE_FORMATS = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp'}
-    SUPPORTED_AUDIO_FORMATS = {'.mp3', '.wav', '.aac', '.m4a', '.ogg', '.flac'}
+    SUPPORTED_AUDIO_FORMATS = {'.mp3', '.wav', '.aac', '.m4a', '.ogg', '.flac','.webm'}
 
     def __init__(self, upload_dir: str, ffmpeg_path: str,ffprobe_path: str):
         self.upload_dir = upload_dir
@@ -2524,27 +2534,124 @@ class UnifiedPipelineEngine:
         filter_parts.append(f"[{current_video_label}]null[vout]")
         filter_complex = ";".join(filter_parts) if filter_parts else None
         
-        return filter_complex, input_files, audio_inputs
+        return filter_complex, input_files, audio_inputs,input_index
     
-    def process_audio_task(self, audio_control, audio_inputs) -> List[str]:
-        """TASK 5: Audio control"""
+    def process_audio_task(self, audio_control, next_input_index: int, video_duration: float):  
         if not audio_control or not audio_control.enabled:
-            return ["-map", "0:a"]
-        
-        print(f"🔹 TASK 5: Processing AUDIO CONTROL (mode: {audio_control.mode})")
-        
-        if audio_control.mode == "mute":
-            return ["-an"]
-        elif audio_control.mode == "keep":
-            return ["-map", "0:a"]
-        elif audio_control.mode == "replace":
-            if not audio_control.audio_filename:
-                raise Exception("Audio filename required for replace mode")
-            self.validate_file_type(audio_control.audio_filename, 'audio')
-            return ["-map", "1:a"]  # Will be adjusted based on input index
-        
-        return ["-map", "0:a"]
-    
+            print("  → RETURNING EARLY: not enabled")
+            return [], None, ["-map", "0:a"]
+
+        mode = audio_control.mode
+
+        if mode == "mute":
+            print("  → RETURNING EARLY: mute")
+            return [], None, ["-an"]
+        if mode == "keep":
+            print("  → RETURNING EARLY: keep")
+            return [], None, ["-map", "0:a"]
+
+        # Build clips list — support both old single-file and new multi-file
+        clips = []
+        if audio_control.audio_clips:
+            clips = audio_control.audio_clips
+        elif audio_control.audio_filename:
+            # backward compat: wrap single file into list
+            from types import SimpleNamespace
+            clips = [SimpleNamespace(
+                audio_filename=audio_control.audio_filename,
+                clip_start=audio_control.clip_start or 0.0,
+                clip_end=audio_control.clip_end,
+            )]
+             
+        if not clips:
+            
+            return [], None, ["-map", "0:a"]
+
+        extra_inputs = []
+        filter_parts = []
+        mixed_labels = []
+        idx = next_input_index
+
+        for i, clip in enumerate(clips):
+            self.validate_file_type(clip.audio_filename, "audio")
+            audio_path = os.path.join(self.upload_dir, clip.audio_filename) 
+            if not os.path.exists(audio_path):
+                
+                continue
+                #raise FileNotFoundError(f"Audio file not found: {clip.audio_filename}")
+
+            # Probe raw duration
+            probe = subprocess.run([
+                self.ffprobe_path, "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                audio_path,
+            ], capture_output=True, text=True)
+            raw_dur = float(probe.stdout.strip())
+            
+
+            clip_start = max(0.0, float(clip.clip_start or 0.0))
+            clip_end   = min(
+                float(clip.clip_end) if clip.clip_end is not None else raw_dur,
+                raw_dur
+            )
+            clipped_dur = clip_end - clip_start
+            if clipped_dur <= 0:
+                continue
+
+            parts = [
+                f"atrim=start={clip_start:.6f}:end={clip_end:.6f}",
+                f"asetpts=PTS-STARTPTS"
+            ]
+
+            # Loop if clip is shorter than video
+            if clipped_dur < video_duration:
+                loops = int(video_duration / clipped_dur) + 1
+                parts.append(f"aloop=loop={loops}:size=2147483647")
+
+            # Hard trim to exact video duration
+            parts.append(f"atrim=end={video_duration:.6f},asetpts=PTS-STARTPTS")
+
+            # Volume
+            vol = getattr(audio_control, 'volume', 1.0)
+            parts.append(f"volume={vol:.4f}")
+
+            label = f"added_a{idx}"
+            filter_parts.append(f"[{idx}:a]{','.join(parts)}[{label}]")
+            mixed_labels.append(label)
+            extra_inputs.extend(["-i", audio_path])
+            idx += 1 
+
+        if not mixed_labels:
+            return [], None, ["-map", "0:a"]
+
+        if mode == "replace":
+            if len(mixed_labels) == 1:
+                single = filter_parts[0]
+                last_label = f"[{mixed_labels[0]}]"
+                filter_fragment = single.rsplit(last_label, 1)[0] + "[aout]"
+            else:
+                all_filters = ";".join(filter_parts)
+                inputs_str = "".join(f"[{l}]" for l in mixed_labels)
+                all_filters += f";{inputs_str}amix=inputs={len(mixed_labels)}:normalize=0,volume={len(mixed_labels)}[aout]"
+                filter_fragment = all_filters
+            audio_map_args = ["-map", "[aout]"]  # ← outside if/else, always set
+
+        else:  # mix
+            orig_vol = getattr(audio_control, 'original_volume', 0.7)
+            all_filters = [f"[0:a]volume={orig_vol:.4f}[orig_a]"]
+            all_filters.extend(filter_parts)
+            all_labels = ["orig_a"] + mixed_labels
+            inputs_str = "".join(f"[{l}]" for l in all_labels)
+            all_filters.append(
+                f"{inputs_str}amix=inputs={len(all_labels)}:normalize=0,"
+                f"volume={len(all_labels)}[aout]"
+            )
+            filter_fragment = ";".join(all_filters)
+            audio_map_args = ["-map", "[aout]"] 
+
+        return extra_inputs, filter_fragment, audio_map_args
+
     def execute_pipeline(self, request: UnifiedPipelineRequest ) -> dict:
         """Execute the complete unified pipeline"""
         
@@ -2620,7 +2727,7 @@ class UnifiedPipelineEngine:
                     video_duration = video_info["duration"]
             
             # Build filter complex
-            filter_complex, input_files, audio_inputs = self.build_filter_complex(
+            filter_complex, input_files, audio_inputs,next_input_index  = self.build_filter_complex(
                 current_video, video_duration,
                 request.text_overlays,
                 request.multiple_inserts,
@@ -2628,18 +2735,32 @@ class UnifiedPipelineEngine:
                 request.split_screen
             )
             
-            # Audio control
-            audio_args = self.process_audio_task(request.audio_control, audio_inputs)
+            # Audio control 
+            audio_filter_fragment = None
+            audio_args = ["-map", "0:a"]
+            audio_mode = (
+                request.audio_control.mode
+                if request.audio_control and request.audio_control.enabled
+                else "keep"
+            )
+
+            if audio_mode in ("replace", "mix"):
+                extra_audio_inputs, audio_filter_fragment, audio_args = self.process_audio_task(
+                    request.audio_control,
+                    next_input_index=next_input_index,
+                    video_duration=video_duration,
+                )
+                input_files.extend(extra_audio_inputs)
+            elif audio_mode == "mute":
+                audio_args = ["-an"]
+
+            if audio_filter_fragment:
+                if filter_complex:
+                    filter_complex = filter_complex + ";" + audio_filter_fragment
+                else:
+                    filter_complex = audio_filter_fragment
             
-            # Add external audio if needed
-            if request.audio_control and request.audio_control.enabled:
-                if request.audio_control.mode == "replace" and request.audio_control.audio_filename:
-                    audio_path = os.path.join(self.upload_dir, request.audio_control.audio_filename)
-                    audio_input_index = len(input_files) // 2
-                    input_files.extend(["-i", audio_path])
-                    # Update audio mapping to use last input
-                    audio_args = ["-map", f"{audio_input_index}:a"]
-            
+           
             # Output filename
             output_name = request.output_name or f"final_{uuid.uuid4().hex}.mp4"
             output_path = os.path.join(self.upload_dir, output_name)
